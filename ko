@@ -20,6 +20,7 @@ if [ "$0" != "/etc/sing-box/sb.sh" ] && [ "$0" != "/usr/bin/sb" ] && [ "$0" != "
 # =========================
 
 export LANG=en_US.UTF-8
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # 定义颜色
 re="\033[0m"
@@ -93,6 +94,21 @@ save_meta() {
 
 load_meta() {
     [ -f "$meta_file" ] && source "$meta_file"
+}
+
+# 实时从 argo.log 提取最新临时域名并同步至 meta.conf
+sync_latest_argo_domain() {
+    load_meta
+    if [ -z "$ARGO_TOKEN" ] && [ -f "${work_dir}/argo.log" ]; then
+        local latest_dom
+        latest_dom=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" 2>/dev/null | tail -1)
+        if [ -n "$latest_dom" ] && [ "$latest_dom" != "$ARGO_DOMAIN" ]; then
+            save_meta "ARGO_DOMAIN" "$latest_dom"
+            ARGO_DOMAIN="$latest_dom"
+            return 0
+        fi
+    fi
+    return 1
 }
 
 # =========================
@@ -207,7 +223,6 @@ EOF
     sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
     sysctl -w vm.vfs_cache_pressure=200 >/dev/null 2>&1 || true
 
-    # 针对 <=128M 小鸡收紧内核网络缓冲区并持久化，防止测速多线程吃光物理内存触发 OOM
     if [ "$mem_total" -le 128 ]; then
         cat >> "$lowmem_conf" 2>/dev/null << 'EOF' || true
 net.core.rmem_max = 262144
@@ -310,32 +325,33 @@ log_watchdog_event() {
     fi
 }
 
+# 精确检测目标二进制进程是否真实存活 (排除 supervise-daemon 外壳与僵尸进程)
 is_process_alive() {
     local bin_path="$1"
     local proc_name="$2"
-    if command_exists pgrep; then
-        pgrep -f "$bin_path" >/dev/null 2>&1 && return 0
-    fi
     if command_exists pidof; then
-        [ -n "$(pidof "$proc_name" 2>/dev/null)" ] && return 0
+        local pid
+        for pid in $(pidof "$proc_name" 2>/dev/null); do
+            if [ -r "/proc/${pid}/stat" ]; then
+                grep -q ") Z" "/proc/${pid}/stat" 2>/dev/null || return 0
+            else
+                return 0
+            fi
+        done
     fi
-    ps -ef 2>/dev/null | grep -v grep | grep -q "$bin_path" && return 0
+    if command_exists pgrep; then
+        pgrep -x "$proc_name" >/dev/null 2>&1 && return 0
+    fi
+    ps -ef 2>/dev/null | grep -v grep | grep -v "supervise-daemon" | grep -v "/bin/sh" | grep -q "$bin_path" && return 0
     return 1
 }
 
 # 看门狗单次执行逻辑 (由 cron 每分钟调用，执行完立即退出不占内存)
 run_watchdog() {
-    # 1. 限制日志大小，防止写满 64M 内存盘
-    for lf in "${work_dir}/sb.log" "${work_dir}/argo.log"; do
-        if [ -f "$lf" ] && [ "$(wc -c < "$lf" 2>/dev/null || echo 0)" -gt 262144 ]; then
-            : > "$lf"
-        fi
-    done
-
-    # 2. 自动补齐重启后可能丢失的防火墙放行规则与 HY2 端口跳跃规则
+    # 1. 自动补齐重启后可能丢失的防火墙放行规则与 HY2 端口跳跃规则
     restore_firewall_rules
 
-    # 3. 检查 sing-box 实际进程存活状态 (仅在进程确实不存在时拉起，避免 OpenRC 状态假死导致误杀)
+    # 2. 检查 sing-box 实际进程存活状态
     if [ -x "${work_dir}/${server_name}" ] && is_service_registered "sing-box"; then
         if ! is_process_alive "${work_dir}/${server_name}" "sing-box"; then
             restart_singbox >/dev/null 2>&1 || true
@@ -343,7 +359,7 @@ run_watchdog() {
         fi
     fi
 
-    # 4. 若启用了 vmess-ws 且未被手动停止，同步检查 Argo 隧道进程与临时域名变更
+    # 3. 检查 Argo 隧道进程存活与临时域名变更
     load_meta
     if [ "${ARGO_STOPPED:-0}" != "1" ] && proto_exists "vmess-ws" && [ -x "${work_dir}/argo" ] && is_service_registered "argo"; then
         if ! is_process_alive "${work_dir}/argo" "argo"; then
@@ -353,17 +369,30 @@ run_watchdog() {
             else
                 restart_argo >/dev/null 2>&1 || true
             fi
-            log_watchdog_event "检测到 Argo 隧道进程异常退出，已自动拉起重启。"
-        elif [ -z "$ARGO_TOKEN" ] && [ -f "${work_dir}/argo.log" ]; then
-            # 防止 systemd/supervise-daemon 秒级自启 Argo 后临时域名变化但未同步到订阅
-            local latest_domain
-            latest_domain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
-            if [ -n "$latest_domain" ] && [ "$latest_domain" != "$ARGO_DOMAIN" ]; then
-                save_meta "ARGO_DOMAIN" "$latest_domain"
+            log_watchdog_event "检测到 Argo 隧道进程异常退出，已自动拉起重启并刷新订阅。"
+        elif [ -z "$ARGO_TOKEN" ]; then
+            # 若已被 systemd/supervise-daemon 秒级自启，提取新临时域名并同步更新订阅
+            if sync_latest_argo_domain; then
                 rebuild_urls >/dev/null 2>&1 || true
-                log_watchdog_event "检测到 Argo 临时域名变更为 ${latest_domain}，已自动更新节点订阅。"
+                log_watchdog_event "检测到 Argo 重启后临时域名变更为 ${ARGO_DOMAIN}，已自动更新节点订阅。"
+            elif [ -f "${work_dir}/argo.log" ] && ! grep -q "trycloudflare\.com" "${work_dir}/argo.log" 2>/dev/null; then
+                # 若进程存活但长时间未生成有效临时域名，重新拉起获取
+                get_quick_tunnel >/dev/null 2>&1 || true
+                rebuild_urls >/dev/null 2>&1 || true
+                log_watchdog_event "检测到 Argo 临时域名缺失，已重新握手获取新域名。"
             fi
         fi
+    fi
+
+    # 4. 限制日志体积 (保留含 trycloudflare.com 的关键行与末尾日志，避免清空丢失临时域名)
+    if [ -f "${work_dir}/sb.log" ] && [ "$(wc -c < "${work_dir}/sb.log" 2>/dev/null || echo 0)" -gt 262144 ]; then
+        tail -n 100 "${work_dir}/sb.log" > "${work_dir}/sb.log.tmp" 2>/dev/null && mv -f "${work_dir}/sb.log.tmp" "${work_dir}/sb.log"
+    fi
+    if [ -f "${work_dir}/argo.log" ] && [ "$(wc -c < "${work_dir}/argo.log" 2>/dev/null || echo 0)" -gt 262144 ]; then
+        {
+            grep "trycloudflare\.com" "${work_dir}/argo.log" 2>/dev/null | tail -n 2
+            tail -n 80 "${work_dir}/argo.log" 2>/dev/null
+        } > "${work_dir}/argo.log.tmp" && mv -f "${work_dir}/argo.log.tmp" "${work_dir}/argo.log"
     fi
 }
 
@@ -443,16 +472,6 @@ check_service_raw() {
         return 2
     fi
 
-    if command_exists rc-service; then
-        if rc-service "${service_name}" status 2>/dev/null | grep -q "started"; then
-            echo "running"; return 0
-        fi
-    else
-        if systemctl is-active "${service_name}" 2>/dev/null | grep -q "^active$"; then
-            echo "running"; return 0
-        fi
-    fi
-
     if is_process_alive "$service_file" "$service_name"; then
         echo "running"; return 0
     fi
@@ -483,13 +502,15 @@ kill_service_residual() {
     [ -z "$svc_bin" ] && return 0
 
     if is_process_alive "$svc_bin" "$service_name"; then
-        pkill -f "$svc_bin" >/dev/null 2>&1 || true
+        pkill -x "$service_name" >/dev/null 2>&1 || pkill -f "$svc_bin" >/dev/null 2>&1 || true
         local _w=0
         while [ "$_w" -lt 10 ] && is_process_alive "$svc_bin" "$service_name"; do
             sleep 0.1
             _w=$((_w + 1))
         done
-        is_process_alive "$svc_bin" "$service_name" && pkill -9 -f "$svc_bin" >/dev/null 2>&1 || true
+        if is_process_alive "$svc_bin" "$service_name"; then
+            pkill -9 -x "$service_name" >/dev/null 2>&1 || pkill -9 -f "$svc_bin" >/dev/null 2>&1 || true
+        fi
     fi
 }
 
@@ -501,7 +522,7 @@ manage_service() {
 
     if [ "$action" == "start" ] || [ "$action" == "restart" ]; then
         if [ -f "${work_dir}/sb.log" ] && [ "$(wc -c < "${work_dir}/sb.log" 2>/dev/null || echo 0)" -gt 262144 ]; then
-            : > "${work_dir}/sb.log"
+            tail -n 100 "${work_dir}/sb.log" > "${work_dir}/sb.log.tmp" 2>/dev/null && mv -f "${work_dir}/sb.log.tmp" "${work_dir}/sb.log"
         fi
     fi
 
@@ -801,7 +822,6 @@ apply_hy2_mport_rules() {
     fi
 }
 
-# 自动恢复重启后丢失的 iptables 放行规则与 HY2 端口跳跃规则
 restore_firewall_rules() {
     if [ -f "$ports_file" ]; then
         while IFS= read -r rule; do
@@ -896,7 +916,6 @@ prompt_custom_port() {
             continue
         fi
 
-        # 检查 sing-box 配置内是否存在相同传输层协议 (TCP/UDP) 的端口冲突，允许 TCP 与 UDP 复用同一端口
         if [ -f "${conf_dir}/inbounds.json" ]; then
             if jq -e --argjson p "$chosen_p" --arg ctag "$current_tag" --arg ptrans "$proto_trans" '
                 def trans(t):
@@ -914,7 +933,6 @@ prompt_custom_port() {
             fi
         fi
 
-        # 检查系统层面是否被其他非 sing-box 服务占用
         if is_system_port_used "$chosen_p" "$proto_trans"; then
             if is_port_owned_by_singbox "$chosen_p" "$proto_trans"; then
                 :
@@ -1373,6 +1391,7 @@ rebuild_urls() {
     local inbounds_file="${conf_dir}/inbounds.json"
     [ ! -f "$inbounds_file" ] && return 1
 
+    sync_latest_argo_domain || true
     load_meta
     local isp
     isp=$(get_isp_name)
@@ -1426,8 +1445,11 @@ rebuild_urls() {
         local m_uuid argodomain
         m_uuid=$(jq -r '.inbounds[] | select(.tag == "vmess-ws") | .users[0].uuid' "$inbounds_file")
         argodomain="${ARGO_DOMAIN}"
-        if [ -z "$argodomain" ] && [ -f "${work_dir}/argo.log" ]; then
-            argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
+        # 若为临时隧道模式，始终优先从 argo.log 提取最新生成的 trycloudflare 域名
+        if [ -z "$ARGO_TOKEN" ] && [ -f "${work_dir}/argo.log" ]; then
+            local latest_log_dom
+            latest_log_dom=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" 2>/dev/null | tail -1)
+            [ -n "$latest_log_dom" ] && argodomain="$latest_log_dom"
         fi
         [ -z "$argodomain" ] && argodomain="argo-pending.trycloudflare.com"
         save_meta "ARGO_DOMAIN" "$argodomain"
@@ -1504,6 +1526,10 @@ rebuild_urls() {
 }
 
 check_nodes() {
+    # 查看节点前自动检查 Argo 临时域名是否在后台重启后发生变更
+    if proto_exists "vmess-ws" && sync_latest_argo_domain; then
+        rebuild_urls >/dev/null 2>&1 || true
+    fi
     if [ ! -f "${sub_file}" ] || [ ! -s "${sub_file}" ]; then
         red "\n当前没有已生成的节点 Base64 数据，请先安装或添加协议。\n"
         return 1
@@ -1521,7 +1547,7 @@ select_install_protocols() {
     echo ""
     purple "=== 选择要生成的协议节点 (支持多选) ==="
     green "  1. vless-reality       (极低内存，TCP直连)"
-    green "  2. vmess-ws + Argo隧道 (套CF隧道，需运行argo进程约占25M内存)"
+    green "  2. vmess-ws + Argo隧道 (套CF隧道，需运行argo进程约占20M内存)"
     green "  3. hysteria2           (UDP高速协议)"
     green "  4. tuic v5             (UDP低延迟协议)"
     green "  5. AnyTLS              (新式TLS伪装协议)"
@@ -1553,7 +1579,6 @@ install_singbox() {
     mkdir -p "${work_dir}" "${conf_dir}"
     chmod 755 "${work_dir}"
 
-    # 默认不生成 endpoints.json，避免未开启 WARP 时常驻占用 WireGuard 内存
     rm -f "${conf_dir}/endpoints.json"
 
     ensure_singbox_binary
@@ -1657,13 +1682,14 @@ EOF
 EOF
 }
 
+# 加入 --ha-connections 1 减少 75% 隧道并发连接内存开销，避免 64M 小鸡重启握手卡死
 get_argo_exec_cmd() {
     load_meta
     local argo_p="${VMESS_PORT:-8001}"
     if [ -n "$ARGO_TOKEN" ]; then
-        printf "exec /etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '%s' > /etc/sing-box/argo.log 2>&1" "${ARGO_TOKEN//\'/}"
+        printf "exec /etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --ha-connections 1 --protocol http2 run --token '%s' >> /etc/sing-box/argo.log 2>&1" "${ARGO_TOKEN//\'/}"
     else
-        printf "exec /etc/sing-box/argo tunnel --url http://127.0.0.1:%s --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1" "$argo_p"
+        printf "exec /etc/sing-box/argo tunnel --url http://127.0.0.1:%s --no-autoupdate --edge-ip-version auto --ha-connections 1 --protocol http2 >> /etc/sing-box/argo.log 2>&1" "$argo_p"
     fi
 }
 
@@ -1671,9 +1697,9 @@ get_argo_args() {
     load_meta
     local argo_p="${VMESS_PORT:-8001}"
     if [ -n "$ARGO_TOKEN" ]; then
-        echo "tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_TOKEN//\'/}"
+        echo "tunnel --edge-ip-version auto --no-autoupdate --ha-connections 1 --protocol http2 run --token ${ARGO_TOKEN//\'/}"
     else
-        echo "tunnel --url http://127.0.0.1:${argo_p} --no-autoupdate --edge-ip-version auto --protocol http2"
+        echo "tunnel --url http://127.0.0.1:${argo_p} --no-autoupdate --edge-ip-version auto --ha-connections 1 --protocol http2"
     fi
 }
 
@@ -1715,8 +1741,8 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 NoNewPrivileges=yes
-Environment="GOGC=20"
-Environment="GOMEMLIMIT=20MiB"
+Environment="GOGC=30"
+Environment="GOMEMLIMIT=32MiB"
 Environment="GOMAXPROCS=1"
 TimeoutStartSec=0
 ExecStart=/bin/sh -c "${argo_cmd}"
@@ -1769,8 +1795,8 @@ description="Cloudflare Tunnel"
 supervisor="supervise-daemon"
 respawn_delay=3
 respawn_max=0
-export GOGC=20
-export GOMEMLIMIT=20MiB
+export GOGC=30
+export GOMEMLIMIT=32MiB
 export GOMAXPROCS=1
 command="/etc/sing-box/argo"
 command_args="${argo_args}"
@@ -1793,8 +1819,8 @@ EOF
         cat > /etc/init.d/argo << EOF
 #!/sbin/openrc-run
 description="Cloudflare Tunnel"
-export GOGC=20
-export GOMEMLIMIT=20MiB
+export GOGC=30
+export GOMEMLIMIT=32MiB
 export GOMAXPROCS=1
 command="/etc/sing-box/argo"
 command_args="${argo_args}"
@@ -1855,8 +1881,8 @@ get_quick_tunnel() {
     sleep 3
     local get_argodomain=""
     if [ -f "${work_dir}/argo.log" ]; then
-        for i in {1..6}; do
-            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
+        for i in {1..8}; do
+            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" 2>/dev/null | tail -1)
             [ -n "$get_argodomain" ] && break
             sleep 2
         done
@@ -2205,7 +2231,6 @@ change_config() {
                 "3")    cfip="cdns.doon.eu.org" ;;
                 "4")    cfip="time.is" ;;
                 *)
-                    # 兼容 [IPv6]:Port、纯 IPv6 地址与普通 Host:Port 格式
                     if [[ "$cf_in" =~ ^\[([0-9a-fA-F:]+)\]:([0-9]+)$ ]]; then
                         cfip="${BASH_REMATCH[1]}"
                         cfport="${BASH_REMATCH[2]}"
@@ -2245,7 +2270,7 @@ manage_singbox() {
 manage_argo() {
     clear; echo ""
     green "=== Argo 隧道管理 (状态: $(check_argo)) ===\n"
-    green "1. 启动 Argo   2. 停止 Argo   3. 重新获取临时域名   4. 配置固定隧道   0. 返回"
+    green "1. 启动 / 重启 Argo   2. 停止 Argo   3. 重新获取临时域名   4. 配置固定隧道   0. 返回"
     reading "请输入选择: " choice
     load_meta
     case "$choice" in
@@ -2258,14 +2283,17 @@ manage_argo() {
                 elif command_exists rc-update; then
                     alpine_openrc_services
                 fi
-            else
-                start_argo
             fi
             if [ -z "$ARGO_TOKEN" ]; then
                 get_quick_tunnel
                 rebuild_urls
+                check_nodes
+            else
+                restart_argo
+                sleep 2
+                rebuild_urls
+                green "固定 Argo 隧道已启动"
             fi
-            green "Argo 隧道已启动"
             ;;
         2)
             save_meta "ARGO_STOPPED" "1"
@@ -2456,7 +2484,7 @@ case "$1" in
         echo ""
         green "快捷键用法: sb [参数]"
         green "  sb                 打开交互式管理菜单"
-        green "  sb -c              直接输出节点 Base64 编码"
+        green "  sb -c              直接输出节点 Base64 编码 (自动同步最新Argo域名)"
         green "  sb --apply-guard   无损启用断联自动重启守护与 64M 防崩溃优化"
         green "  sb -w              执行一次进程存活看门狗巡检"
         green "  sb -boff           直接关闭 BBR 加速通道 (或 sb --bbr-off)"
