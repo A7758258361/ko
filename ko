@@ -15,7 +15,7 @@ if [ "$0" != "/etc/sing-box/sb.sh" ] && [ "$0" != "/usr/bin/sb" ] && [ "$0" != "
 #!/usr/bin/env bash
 
 # =========================
-# sing-box 64M极简低内存多协议脚本 (自动重启守护 + 64M防OOM优化版)
+# sing-box 64M极简低内存多协议脚本 (自动重启守护 + 64M防OOM优化 + DoH加密DNS切换版)
 # 支持协议: vless-reality | vmess-ws(argo) | hysteria2 | tuic5 | anytls | socks5 | ss2022
 # =========================
 
@@ -31,9 +31,9 @@ purple="\e[1;35m"
 skyblue="\e[1;36m"
 red() { echo -e "\e[1;91m$1\033[0m"; }
 green() { echo -e "\e[1;32m$1\e[0m"; }
-yellow() { echo -e "\e[1;33m$1\e[0m"; }
-purple() { echo -e "\e[1;35m$1\e[0m"; }
-skyblue() { echo -e "\e[1;36m$1\e[0m"; }
+yellow() { echo -e "\e[1;33m$1\033[0m"; }
+purple() { echo -e "\e[1;35m$1\033[0m"; }
+skyblue() { echo -e "\e[1;36m$1\033[0m"; }
 reading() { read -p "$(red "$1")" "$2"; }
 
 # 定义路径常量
@@ -188,7 +188,7 @@ manage_bbr_menu() {
     case "$bbr_choice" in
         1) enable_bbr ;;
         2) disable_bbr ;;
-        0) return ;;
+        0) need_pause=false; return ;;
         *) red "无效的选项！" ;;
     esac
 }
@@ -438,7 +438,7 @@ manage_watchdog_menu() {
                 yellow "暂无异常重启记录，节点运行正常。"
             fi
             ;;
-        0) return ;;
+        0) need_pause=false; return ;;
         *) red "无效的选项！" ;;
     esac
 }
@@ -567,6 +567,308 @@ restart_singbox() { manage_service "sing-box" "restart"; }
 start_argo()      { manage_service "argo" "start"; }
 stop_argo()       { manage_service "argo" "stop"; }
 restart_argo()    { manage_service "argo" "restart"; }
+
+# =========================
+# DNS 加密管理模块 (DoH 防劫持 / 恢复系统默认)
+# =========================
+get_current_dns_strategy() {
+    local dns_file="${conf_dir}/dns.json"
+    local strat=""
+    if [ -f "$dns_file" ] && command_exists jq; then
+        strat=$(jq -r '.dns.strategy // empty' "$dns_file" 2>/dev/null)
+    fi
+    if [ "$strat" != "prefer_ipv4" ] && [ "$strat" != "prefer_ipv6" ] && [ "$strat" != "ipv4_only" ] && [ "$strat" != "ipv6_only" ]; then
+        load_meta
+        if [ "$STACK_MODE" == "v6" ]; then
+            strat="prefer_ipv6"
+        else
+            strat="prefer_ipv4"
+        fi
+    fi
+    echo "$strat"
+}
+
+check_dns_status() {
+    local dns_file="${conf_dir}/dns.json"
+    if [ "$(check_service_raw sing-box)" == "not installed" ] || [ ! -f "$dns_file" ]; then
+        yellow "未安装"
+        return
+    fi
+    if ! command_exists jq; then
+        yellow "未知 (缺少 jq)"
+        return
+    fi
+    local dtype dsrv dstrat
+    dtype=$(jq -r '.dns.servers[0].type // "local"' "$dns_file" 2>/dev/null)
+    dsrv=$(jq -r '.dns.servers[0].server // empty' "$dns_file" 2>/dev/null)
+    dstrat=$(jq -r '.dns.strategy // "prefer_ipv4"' "$dns_file" 2>/dev/null)
+
+    if [ "$dtype" == "https" ]; then
+        green "加密 DoH (${dsrv:-unknown} | ${dstrat})"
+    elif [ "$dtype" == "local" ]; then
+        yellow "系统默认 local (${dstrat})"
+    else
+        skyblue "${dtype}${dsrv:+ (${dsrv})} | ${dstrat}"
+    fi
+}
+
+is_valid_dns_ip() {
+    local ip="$1"
+    if printf '%s' "$ip" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        local o1 o2 o3 o4
+        IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+        (( 10#$o1 <= 255 && 10#$o2 <= 255 && 10#$o3 <= 255 && 10#$o4 <= 255 )) && return 0
+        return 1
+    elif [[ "$ip" == *":"* ]] && printf '%s' "$ip" | grep -Eq '^[0-9a-fA-F:]+$' && printf '%s' "$ip" | grep -Eq '[0-9a-fA-F]'; then
+        return 0
+    fi
+    return 1
+}
+
+apply_dns_config() {
+    local mode="$1"
+    local server_ip="${2:-}"
+    local strat_override="${3:-}"
+    local dns_file="${conf_dir}/dns.json"
+    local tmp_file="${work_dir}/dns.json.tmp"
+    local bak_file="${work_dir}/dns.json.bak"
+
+    if [ "$(check_service_raw sing-box)" == "not installed" ]; then
+        red "sing-box 尚未安装，请先选择 1 安装！"
+        return 1
+    fi
+
+    local dns_strategy
+    dns_strategy="${strat_override:-$(get_current_dns_strategy)}"
+
+    if [ "$mode" == "doh" ]; then
+        server_ip=$(printf '%s' "$server_ip" | tr -d '[] \t\r\n')
+        if ! is_valid_dns_ip "$server_ip"; then
+            red "错误: [${server_ip}] 不是有效的纯 IPv4 或 IPv6 地址！"
+            yellow "提示: 为防止被母机 53 端口劫持，DoH 上游必须使用纯 IP (例如 8.8.8.8 或 1.1.1.1)。"
+            return 1
+        fi
+    fi
+
+    mkdir -p "$conf_dir"
+    rm -f "$tmp_file" "$bak_file"
+    [ -f "$dns_file" ] && cp -f "$dns_file" "$bak_file"
+
+    if [ "$mode" == "doh" ]; then
+        if command_exists jq; then
+            jq -n --arg srv "$server_ip" --arg strat "$dns_strategy" '{
+              dns: {
+                servers: [
+                  {
+                    tag: "local",
+                    type: "https",
+                    server: $srv
+                  }
+                ],
+                strategy: $strat
+              }
+            }' > "$tmp_file"
+        else
+            cat > "$tmp_file" << EOF
+{
+  "dns": {
+    "servers": [
+      {
+        "tag": "local",
+        "type": "https",
+        "server": "${server_ip}"
+      }
+    ],
+    "strategy": "${dns_strategy}"
+  }
+}
+EOF
+        fi
+    else
+        if command_exists jq; then
+            jq -n --arg strat "$dns_strategy" '{
+              dns: {
+                servers: [
+                  {
+                    tag: "local",
+                    type: "local"
+                  }
+                ],
+                strategy: $strat
+              }
+            }' > "$tmp_file"
+        else
+            cat > "$tmp_file" << EOF
+{
+  "dns": {
+    "servers": [
+      {
+        "tag": "local",
+        "type": "local"
+      }
+    ],
+    "strategy": "${dns_strategy}"
+  }
+}
+EOF
+        fi
+    fi
+
+    if [ ! -s "$tmp_file" ]; then
+        red "错误: 生成 DNS 配置文件失败，未改动现有配置！"
+        rm -f "$tmp_file" "$bak_file"
+        return 1
+    fi
+
+    mv -f "$tmp_file" "$dns_file"
+
+    local check_err
+    if ! check_err=$("${work_dir}/${server_name}" check -C "${conf_dir}" 2>&1); then
+        red "sing-box 配置校验失败，已自动回滚原 DNS 配置！"
+        [ -n "$check_err" ] && yellow "错误详情: ${check_err}"
+        if [ -f "$bak_file" ]; then
+            mv -f "$bak_file" "$dns_file"
+        else
+            rm -f "$dns_file"
+        fi
+        return 1
+    fi
+
+    rm -f "$bak_file"
+    restart_singbox
+    sleep 1
+
+    if is_process_alive "${work_dir}/${server_name}" "sing-box"; then
+        if [ "$mode" == "doh" ]; then
+            green "已成功开启加密 DoH (${server_ip} | ${dns_strategy}) 并重启生效！"
+        else
+            green "已成功恢复系统默认 DNS (local | ${dns_strategy}) 并重启生效！"
+        fi
+        return 0
+    else
+        yellow "DNS 配置已校验通过并写入，但重启后未检测到 sing-box 存活进程，请检查 ${work_dir}/sb.log。"
+        return 1
+    fi
+}
+
+enable_doh() {
+    local srv="${1:-8.8.8.8}"
+    apply_dns_config "doh" "$srv"
+}
+
+disable_doh() {
+    apply_dns_config "local"
+}
+
+switch_dns_strategy() {
+    local new_strat="$1"
+    local dns_file="${conf_dir}/dns.json"
+    if [ "$(check_service_raw sing-box)" == "not installed" ] || [ ! -f "$dns_file" ]; then
+        red "sing-box 尚未安装，请先选择 1 安装！"
+        return 1
+    fi
+    local cur_type="local" cur_srv=""
+    if command_exists jq; then
+        cur_type=$(jq -r '.dns.servers[0].type // "local"' "$dns_file" 2>/dev/null)
+        cur_srv=$(jq -r '.dns.servers[0].server // empty' "$dns_file" 2>/dev/null)
+    fi
+    if [ "$cur_type" == "https" ] && [ -n "$cur_srv" ]; then
+        apply_dns_config "doh" "$cur_srv" "$new_strat"
+    else
+        apply_dns_config "local" "" "$new_strat"
+    fi
+}
+
+test_doh_connectivity() {
+    yellow "正在检测系统 DNS 与各 DoH 上游对 Cloudflare 测速接口的连通性..."
+    echo ""
+    local res code
+
+    res=$(curl -sI --max-time 4 "https://speed.cloudflare.com/__down?bytes=1000" 2>&1)
+    code=$(echo "$res" | awk 'NR==1 && /^HTTP\// {print $1, $2}' | tr -d '\r')
+    if [ -n "$code" ]; then
+        echo -e " 系统默认 DNS (53端口)       : ${green}正常 (${code})${re}"
+    else
+        echo -e " 系统默认 DNS (53端口)       : ${red}失败 / 可能被母机劫持${re}"
+    fi
+
+    local targets=(
+        "8.8.8.8|Google DoH (IPv4)    "
+        "1.1.1.1|Cloudflare DoH (IPv4)"
+        "2001:4860:4860::8888|Google DoH (IPv6)    "
+        "2606:4700:4700::1111|Cloudflare DoH (IPv6)"
+    )
+    local entry ip label url_host
+    for entry in "${targets[@]}"; do
+        ip="${entry%%|*}"
+        label="${entry#*|}"
+        url_host="$ip"
+        [[ "$ip" == *":"* ]] && url_host="[${ip}]"
+        res=$(curl -sI --max-time 4 --doh-url "https://${url_host}/dns-query" "https://speed.cloudflare.com/__down?bytes=1000" 2>&1)
+        code=$(echo "$res" | awk 'NR==1 && /^HTTP\// {print $1, $2}' | tr -d '\r')
+        if [ -n "$code" ]; then
+            echo -e " ${label} : ${green}可用 (${code})${re}"
+        else
+            echo -e " ${label} : ${yellow}不可达 / 超时${re}"
+        fi
+    done
+    echo ""
+}
+
+manage_dns_menu() {
+    if [ "$(check_service_raw sing-box)" == "not installed" ]; then
+        yellow "sing-box 尚未安装！请先选择 1 安装。"
+        return
+    fi
+
+    clear; echo ""
+    green "=== DNS 加密管理 (防母机 53 端口劫持 / 测速修复) ==="
+    echo -e "\n当前 DNS 状态: $(check_dns_status)\n"
+    green "1. 开启加密 DoH - Google IPv4 (8.8.8.8)             [推荐]"
+    green "2. 开启加密 DoH - Cloudflare IPv4 (1.1.1.1)"
+    green "3. 开启加密 DoH - Google IPv6 (2001:4860:4860::8888)"
+    green "4. 开启加密 DoH - Cloudflare IPv6 (2606:4700:4700::1111)"
+    green "5. 自定义纯 IP DoH 上游地址 (IPv4 / IPv6)"
+    skyblue "--------------------------------------------------------"
+    yellow "6. 恢复系统默认 DNS (local)"
+    skyblue "--------------------------------------------------------"
+    purple "7. 切换域名解析优先策略 (prefer_ipv4 / prefer_ipv6)"
+    purple "8. 检测当前系统 DNS 与 DoH 连通性 (Cloudflare 测速接口)"
+    skyblue "--------------------------------------------------------"
+    purple "0. 返回主菜单"
+    skyblue "--------------------------------------------------------"
+    reading "请输入选择: " dns_choice
+    echo ""
+    case "$dns_choice" in
+        1) enable_doh "8.8.8.8" ;;
+        2) enable_doh "1.1.1.1" ;;
+        3) enable_doh "2001:4860:4860::8888" ;;
+        4) enable_doh "2606:4700:4700::1111" ;;
+        5)
+            reading "请输入纯 IP 形式的 DoH 上游地址 (例如 8.8.4.4 或 1.0.0.1): " custom_doh_ip
+            [ -z "$custom_doh_ip" ] && { yellow "未输入地址，已取消操作。"; return; }
+            enable_doh "$custom_doh_ip"
+            ;;
+        6) disable_doh ;;
+        7)
+            local cur_strat
+            cur_strat=$(get_current_dns_strategy)
+            echo -e "当前解析策略: ${skyblue}${cur_strat}${re}\n"
+            green "  1. IPv4 优先 (prefer_ipv4)"
+            green "  2. IPv6 优先 (prefer_ipv6)"
+            reading "请选择解析策略 (1-2): " strat_choice
+            echo ""
+            case "$strat_choice" in
+                1) switch_dns_strategy "prefer_ipv4" ;;
+                2) switch_dns_strategy "prefer_ipv6" ;;
+                *) red "无效的选项！" ;;
+            esac
+            ;;
+        8) test_doh_connectivity ;;
+        0) need_pause=false; return ;;
+        *) red "无效的选项！" ;;
+    esac
+}
 
 # =========================
 # 极简依赖安装
@@ -2251,7 +2553,7 @@ change_config() {
             rebuild_urls
             check_nodes
             ;;
-        0) return ;;
+        0) need_pause=false; return ;;
     esac
 }
 
@@ -2264,6 +2566,7 @@ manage_singbox() {
         1) start_singbox && green "已启动" ;;
         2) stop_singbox && yellow "已停止" ;;
         3) restart_singbox && green "已重启" ;;
+        0) need_pause=false; return ;;
     esac
 }
 
@@ -2329,6 +2632,7 @@ manage_argo() {
                 green "固定隧道参数已保存，请先在 [4. 协议节点管理] 中添加 vmess-ws(Argo) 即可生效。"
             fi
             ;;
+        0) need_pause=false; return ;;
     esac
 }
 
@@ -2410,6 +2714,7 @@ EOF
             restart_singbox
             green "已卸载 WARP WireGuard 组件、清空分流规则并恢复服务器原IP直连！"
             ;;
+        0) need_pause=false; return ;;
     esac
 }
 
@@ -2418,12 +2723,14 @@ menu() {
     argo_status=$(check_argo 2>/dev/null)
     bbr_status=$(check_bbr_status 2>/dev/null)
     wd_status=$(check_watchdog_status 2>/dev/null)
+    dns_status=$(check_dns_status 2>/dev/null)
 
     clear; echo ""
     purple "=== sing-box 64M极简管理面板 (快捷键: sb) ==="
     echo ""
     purple "sing-box: ${singbox_status}  |  Argo: ${argo_status}"
     purple "BBR: ${bbr_status}  |  自动守护: ${wd_status}"
+    purple "DNS: ${dns_status}"
     echo "=========================================================="
     green "1. 安装 / 重装 sing-box (自动开BBR + 指定协议/端口 + 设v4/v6/双栈)"
     red   "2. 彻底卸载 sing-box 并恢复初始状态"
@@ -2438,6 +2745,7 @@ menu() {
     green "9. WARP 分流管理"
     green "10. BBR 加速管理 (开启 / 关闭 BBR 加速通道)"
     green "11. 断联自动重启守护管理 (秒级自启 + 64M防OOM优化)"
+    green "12. DNS 加密管理 (开启 DoH 防劫持 / 恢复系统默认 DNS)"
     echo "=========================================================="
     red   "0. 退出脚本"
     echo "=========================================================="
@@ -2480,6 +2788,14 @@ case "$1" in
         disable_bbr
         exit 0
         ;;
+    --doh-on | --doh)
+        enable_doh "${2:-8.8.8.8}"
+        exit $?
+        ;;
+    --doh-off)
+        disable_doh
+        exit $?
+        ;;
     -h | --help)
         echo ""
         green "快捷键用法: sb [参数]"
@@ -2489,6 +2805,8 @@ case "$1" in
         green "  sb -w              执行一次进程存活看门狗巡检"
         green "  sb -boff           直接关闭 BBR 加速通道 (或 sb --bbr-off)"
         green "  sb -bon            直接开启 BBR 加速通道 (或 sb --bbr-on)"
+        green "  sb --doh-on [IP]   开启加密 DoH (默认 8.8.8.8，可指定 1.1.1.1 等纯IP)"
+        green "  sb --doh-off       恢复系统默认 DNS (local)"
         green "  sb -r              重启服务、刷新 Argo 临时域名并输出 Base64"
         green "  sb -u              直接彻底卸载并恢复初始状态"
         echo ""
@@ -2497,7 +2815,7 @@ case "$1" in
     "")
         while true; do
             menu
-            reading "请输入选择 (0-11): " choice
+            reading "请输入选择 (0-12): " choice
             echo ""
             need_pause=true
             case "${choice}" in
@@ -2538,8 +2856,9 @@ case "$1" in
                 9)  warp_manage;             need_pause=true ;;
                 10) manage_bbr_menu;         need_pause=true ;;
                 11) manage_watchdog_menu;    need_pause=true ;;
+                12) manage_dns_menu;         need_pause=true ;;
                 0)  exit 0 ;;
-                *)  red "无效的选项，请输入 0-11"; need_pause=true ;;
+                *)  red "无效的选项，请输入 0-12"; need_pause=true ;;
             esac
             [ "$need_pause" = true ] && read -n 1 -s -r -p $'\033[1;91m按任意键返回主菜单...\033[0m'
         done
