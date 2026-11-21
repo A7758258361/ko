@@ -15,7 +15,7 @@ if [ "$0" != "/etc/sing-box/sb.sh" ] && [ "$0" != "/usr/bin/sb" ] && [ "$0" != "
 #!/usr/bin/env bash
 
 # =========================
-# sing-box 64M极简低内存多协议脚本 (自动重启守护 + 64M防OOM优化 + DoH加密DNS切换版)
+# sing-box 64M极简低内存多协议脚本 (自动守护 + 防OOM + DoH防劫持 + 自检与测速版)
 # 支持协议: vless-reality | vmess-ws(argo) | hysteria2 | tuic5 | anytls | socks5 | ss2022
 # =========================
 
@@ -31,9 +31,9 @@ purple="\e[1;35m"
 skyblue="\e[1;36m"
 red() { echo -e "\e[1;91m$1\033[0m"; }
 green() { echo -e "\e[1;32m$1\e[0m"; }
-yellow() { echo -e "\e[1;33m$1\033[0m"; }
-purple() { echo -e "\e[1;35m$1\033[0m"; }
-skyblue() { echo -e "\e[1;36m$1\033[0m"; }
+yellow() { echo -e "\e[1;33m$1\e[0m"; }
+purple() { echo -e "\e[1;35m$1\e[0m"; }
+skyblue() { echo -e "\e[1;36m$1\e[0m"; }
 reading() { read -p "$(red "$1")" "$2"; }
 
 # 定义路径常量
@@ -348,10 +348,8 @@ is_process_alive() {
 
 # 看门狗单次执行逻辑 (由 cron 每分钟调用，执行完立即退出不占内存)
 run_watchdog() {
-    # 1. 自动补齐重启后可能丢失的防火墙放行规则与 HY2 端口跳跃规则
     restore_firewall_rules
 
-    # 2. 检查 sing-box 实际进程存活状态
     if [ -x "${work_dir}/${server_name}" ] && is_service_registered "sing-box"; then
         if ! is_process_alive "${work_dir}/${server_name}" "sing-box"; then
             restart_singbox >/dev/null 2>&1 || true
@@ -359,7 +357,6 @@ run_watchdog() {
         fi
     fi
 
-    # 3. 检查 Argo 隧道进程存活与临时域名变更
     load_meta
     if [ "${ARGO_STOPPED:-0}" != "1" ] && proto_exists "vmess-ws" && [ -x "${work_dir}/argo" ] && is_service_registered "argo"; then
         if ! is_process_alive "${work_dir}/argo" "argo"; then
@@ -371,12 +368,10 @@ run_watchdog() {
             fi
             log_watchdog_event "检测到 Argo 隧道进程异常退出，已自动拉起重启并刷新订阅。"
         elif [ -z "$ARGO_TOKEN" ]; then
-            # 若已被 systemd/supervise-daemon 秒级自启，提取新临时域名并同步更新订阅
             if sync_latest_argo_domain; then
                 rebuild_urls >/dev/null 2>&1 || true
                 log_watchdog_event "检测到 Argo 重启后临时域名变更为 ${ARGO_DOMAIN}，已自动更新节点订阅。"
             elif [ -f "${work_dir}/argo.log" ] && ! grep -q "trycloudflare\.com" "${work_dir}/argo.log" 2>/dev/null; then
-                # 若进程存活但长时间未生成有效临时域名，重新拉起获取
                 get_quick_tunnel >/dev/null 2>&1 || true
                 rebuild_urls >/dev/null 2>&1 || true
                 log_watchdog_event "检测到 Argo 临时域名缺失，已重新握手获取新域名。"
@@ -384,7 +379,6 @@ run_watchdog() {
         fi
     fi
 
-    # 4. 限制日志体积 (保留含 trycloudflare.com 的关键行与末尾日志，避免清空丢失临时域名)
     if [ -f "${work_dir}/sb.log" ] && [ "$(wc -c < "${work_dir}/sb.log" 2>/dev/null || echo 0)" -gt 262144 ]; then
         tail -n 100 "${work_dir}/sb.log" > "${work_dir}/sb.log.tmp" 2>/dev/null && mv -f "${work_dir}/sb.log.tmp" "${work_dir}/sb.log"
     fi
@@ -569,8 +563,23 @@ stop_argo()       { manage_service "argo" "stop"; }
 restart_argo()    { manage_service "argo" "restart"; }
 
 # =========================
-# DNS 加密管理模块 (DoH 防劫持 / 恢复系统默认)
+# DNS 加密管理模块 (DoH 防劫持 / 自动补全 Host 与 SNI / 恢复系统默认)
 # =========================
+get_doh_host_for_ip() {
+    case "$1" in
+        1.1.1.1|1.0.0.1|2606:4700:4700::1111|2606:4700:4700::1001)
+            echo "cloudflare-dns.com" ;;
+        8.8.8.8|8.8.4.4|2001:4860:4860::8888|2001:4860:4860::8844)
+            echo "dns.google" ;;
+        9.9.9.9|149.112.112.112|2620:fe::fe|2620:fe::9)
+            echo "dns.quad9.net" ;;
+        223.5.5.5|223.6.6.6|2400:3200::1|2400:3200:baba::1)
+            echo "dns.alidns.com" ;;
+        *)
+            echo "" ;;
+    esac
+}
+
 get_current_dns_strategy() {
     local dns_file="${conf_dir}/dns.json"
     local strat=""
@@ -629,6 +638,7 @@ apply_dns_config() {
     local mode="$1"
     local server_ip="${2:-}"
     local strat_override="${3:-}"
+    local host_override="${4:-}"
     local dns_file="${conf_dir}/dns.json"
     local tmp_file="${work_dir}/dns.json.tmp"
     local bak_file="${work_dir}/dns.json.bak"
@@ -641,6 +651,7 @@ apply_dns_config() {
     local dns_strategy
     dns_strategy="${strat_override:-$(get_current_dns_strategy)}"
 
+    local doh_host=""
     if [ "$mode" == "doh" ]; then
         server_ip=$(printf '%s' "$server_ip" | tr -d '[] \t\r\n')
         if ! is_valid_dns_ip "$server_ip"; then
@@ -648,6 +659,7 @@ apply_dns_config() {
             yellow "提示: 为防止被母机 53 端口劫持，DoH 上游必须使用纯 IP (例如 8.8.8.8 或 1.1.1.1)。"
             return 1
         fi
+        doh_host="${host_override:-$(get_doh_host_for_ip "$server_ip")}"
     fi
 
     mkdir -p "$conf_dir"
@@ -655,34 +667,88 @@ apply_dns_config() {
     [ -f "$dns_file" ] && cp -f "$dns_file" "$bak_file"
 
     if [ "$mode" == "doh" ]; then
-        if command_exists jq; then
-            jq -n --arg srv "$server_ip" --arg strat "$dns_strategy" '{
-              dns: {
-                servers: [
-                  {
-                    tag: "local",
-                    type: "https",
-                    server: $srv
+        if [ -n "$doh_host" ]; then
+            if command_exists jq; then
+                jq -n --arg srv "$server_ip" --arg host "$doh_host" --arg strat "$dns_strategy" '{
+                  dns: {
+                    servers: [
+                      {
+                        tag: "local",
+                        type: "https",
+                        server: $srv,
+                        server_port: 443,
+                        path: "/dns-query",
+                        headers: {
+                          Host: $host
+                        },
+                        tls: {
+                          enabled: true,
+                          server_name: $host
+                        }
+                      }
+                    ],
+                    strategy: $strat
                   }
-                ],
-                strategy: $strat
-              }
-            }' > "$tmp_file"
-        else
-            cat > "$tmp_file" << EOF
+                }' > "$tmp_file"
+            else
+                cat > "$tmp_file" << EOF
 {
   "dns": {
     "servers": [
       {
         "tag": "local",
         "type": "https",
-        "server": "${server_ip}"
+        "server": "${server_ip}",
+        "server_port": 443,
+        "path": "/dns-query",
+        "headers": {
+          "Host": "${doh_host}"
+        },
+        "tls": {
+          "enabled": true,
+          "server_name": "${doh_host}"
+        }
       }
     ],
     "strategy": "${dns_strategy}"
   }
 }
 EOF
+            fi
+        else
+            if command_exists jq; then
+                jq -n --arg srv "$server_ip" --arg strat "$dns_strategy" '{
+                  dns: {
+                    servers: [
+                      {
+                        tag: "local",
+                        type: "https",
+                        server: $srv,
+                        server_port: 443,
+                        path: "/dns-query"
+                      }
+                    ],
+                    strategy: $strat
+                  }
+                }' > "$tmp_file"
+            else
+                cat > "$tmp_file" << EOF
+{
+  "dns": {
+    "servers": [
+      {
+        "tag": "local",
+        "type": "https",
+        "server": "${server_ip}",
+        "server_port": 443,
+        "path": "/dns-query"
+      }
+    ],
+    "strategy": "${dns_strategy}"
+  }
+}
+EOF
+            fi
         fi
     else
         if command_exists jq; then
@@ -740,7 +806,7 @@ EOF
 
     if is_process_alive "${work_dir}/${server_name}" "sing-box"; then
         if [ "$mode" == "doh" ]; then
-            green "已成功开启加密 DoH (${server_ip} | ${dns_strategy}) 并重启生效！"
+            green "已成功开启加密 DoH (${server_ip}${doh_host:+ / ${doh_host}} | ${dns_strategy}) 并重启生效！"
         else
             green "已成功恢复系统默认 DNS (local | ${dns_strategy}) 并重启生效！"
         fi
@@ -753,7 +819,8 @@ EOF
 
 enable_doh() {
     local srv="${1:-8.8.8.8}"
-    apply_dns_config "doh" "$srv"
+    local custom_host="${2:-}"
+    apply_dns_config "doh" "$srv" "" "$custom_host"
 }
 
 disable_doh() {
@@ -767,13 +834,14 @@ switch_dns_strategy() {
         red "sing-box 尚未安装，请先选择 1 安装！"
         return 1
     fi
-    local cur_type="local" cur_srv=""
+    local cur_type="local" cur_srv="" cur_host=""
     if command_exists jq; then
         cur_type=$(jq -r '.dns.servers[0].type // "local"' "$dns_file" 2>/dev/null)
         cur_srv=$(jq -r '.dns.servers[0].server // empty' "$dns_file" 2>/dev/null)
+        cur_host=$(jq -r '.dns.servers[0].headers.Host // .dns.servers[0].tls.server_name // empty' "$dns_file" 2>/dev/null)
     fi
     if [ "$cur_type" == "https" ] && [ -n "$cur_srv" ]; then
-        apply_dns_config "doh" "$cur_srv" "$new_strat"
+        apply_dns_config "doh" "$cur_srv" "$new_strat" "$cur_host"
     else
         apply_dns_config "local" "" "$new_strat"
     fi
@@ -793,18 +861,18 @@ test_doh_connectivity() {
     fi
 
     local targets=(
-        "8.8.8.8|Google DoH (IPv4)    "
-        "1.1.1.1|Cloudflare DoH (IPv4)"
-        "2001:4860:4860::8888|Google DoH (IPv6)    "
-        "2606:4700:4700::1111|Cloudflare DoH (IPv6)"
+        "8.8.8.8|dns.google|Google DoH (IPv4)    "
+        "1.1.1.1|cloudflare-dns.com|Cloudflare DoH (IPv4)"
+        "2001:4860:4860::8888|dns.google|Google DoH (IPv6)    "
+        "2606:4700:4700::1111|cloudflare-dns.com|Cloudflare DoH (IPv6)"
     )
-    local entry ip label url_host
+    local entry ip host label
     for entry in "${targets[@]}"; do
         ip="${entry%%|*}"
-        label="${entry#*|}"
-        url_host="$ip"
-        [[ "$ip" == *":"* ]] && url_host="[${ip}]"
-        res=$(curl -sI --max-time 4 --doh-url "https://${url_host}/dns-query" "https://speed.cloudflare.com/__down?bytes=1000" 2>&1)
+        local rest="${entry#*|}"
+        host="${rest%%|*}"
+        label="${rest#*|}"
+        res=$(curl -sI --max-time 4 --resolve "${host}:443:${ip}" --doh-url "https://${host}/dns-query" "https://speed.cloudflare.com/__down?bytes=1000" 2>&1)
         code=$(echo "$res" | awk 'NR==1 && /^HTTP\// {print $1, $2}' | tr -d '\r')
         if [ -n "$code" ]; then
             echo -e " ${label} : ${green}可用 (${code})${re}"
@@ -845,9 +913,10 @@ manage_dns_menu() {
         3) enable_doh "2001:4860:4860::8888" ;;
         4) enable_doh "2606:4700:4700::1111" ;;
         5)
-            reading "请输入纯 IP 形式的 DoH 上游地址 (例如 8.8.4.4 或 1.0.0.1): " custom_doh_ip
+            reading "请输入纯 IP 形式的 DoH 上游地址 (例如 9.9.9.9): " custom_doh_ip
             [ -z "$custom_doh_ip" ] && { yellow "未输入地址，已取消操作。"; return; }
-            enable_doh "$custom_doh_ip"
+            reading "请输入对应的 Host/SNI 域名 (已知公共IP回车自动匹配，未知可留空): " custom_doh_host
+            enable_doh "$custom_doh_ip" "$custom_doh_host"
             ;;
         6) disable_doh ;;
         7)
@@ -865,6 +934,149 @@ manage_dns_menu() {
             esac
             ;;
         8) test_doh_connectivity ;;
+        0) need_pause=false; return ;;
+        *) red "无效的选项！" ;;
+    esac
+}
+
+# =========================
+# 节点连通性自检与 64M 轻量级测速模块
+# =========================
+test_nodes_health() {
+    echo ""
+    green "==================== 节点运行与连通性自检 ===================="
+    if [ "$(check_service_raw sing-box)" == "running" ]; then
+        echo -e " 1. sing-box 核心进程  : ${green}运行正常${re}"
+    else
+        echo -e " 1. sing-box 核心进程  : ${red}未运行 (请检查 ${work_dir}/sb.log)${re}"
+    fi
+
+    local inbounds_file="${conf_dir}/inbounds.json"
+    if [ -f "$inbounds_file" ] && command_exists jq; then
+        echo -e " 2. 已启用协议端口监听 :"
+        local tag port ptype trans
+        while IFS='|' read -r tag port ptype; do
+            [ -z "$tag" ] && continue
+            trans="tcp"
+            [ "$ptype" == "hysteria2" ] || [ "$ptype" == "tuic" ] && trans="udp"
+            [ "$ptype" == "socks" ] || [ "$ptype" == "shadowsocks" ] && trans="both"
+            if is_system_port_used "$port" "$trans"; then
+                printf "    - %-18s (端口 %-5s / %-4s) : ${green}监听正常${re}\n" "$tag" "$port" "$trans"
+            else
+                printf "    - %-18s (端口 %-5s / %-4s) : ${red}未检测到监听${re}\n" "$tag" "$port" "$trans"
+            fi
+        done < <(jq -r '.inbounds[] | "\(.tag)|\(.listen_port)|\(.type)"' "$inbounds_file" 2>/dev/null)
+    fi
+
+    if proto_exists "vmess-ws"; then
+        if [ "$(check_service_raw argo)" == "running" ]; then
+            echo -e " 3. Argo 隧道进程      : ${green}运行正常${re}"
+        else
+            echo -e " 3. Argo 隧道进程      : ${yellow}未运行${re}"
+        fi
+    fi
+
+    local g_out g_code g_ms
+    g_out=$(curl -s -o /dev/null -w "%{http_code}|%{time_starttransfer}" --max-time 5 "https://www.gstatic.com/generate_204" 2>/dev/null)
+    g_code="${g_out%%|*}"
+    g_ms=$(awk -v t="${g_out#*|}" 'BEGIN {printf "%.0f", t * 1000}')
+    if [ "$g_code" == "204" ] || [ "$g_code" == "200" ]; then
+        echo -e " 4. Google 204 出口    : ${green}畅通 (HTTP ${g_code} | ${g_ms} ms)${re}"
+    else
+        echo -e " 4. Google 204 出口    : ${red}异常 (HTTP ${g_code:-超时})${re}"
+    fi
+
+    local cf_code
+    cf_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
+    if [ "$cf_code" == "200" ]; then
+        echo -e " 5. Cloudflare 测速口  : ${green}直连畅通 (HTTP 200)${re}"
+    else
+        local cf_doh_code
+        cf_doh_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 --resolve "dns.google:443:8.8.8.8" --doh-url "https://dns.google/dns-query" "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
+        if [ "$cf_doh_code" == "200" ]; then
+            echo -e " 5. Cloudflare 测速口  : ${yellow}系统DNS受限，但加密DoH畅通 (建议进菜单 12 开启DoH)${re}"
+        else
+            echo -e " 5. Cloudflare 测速口  : ${yellow}暂不可达 (HTTP ${cf_code:-超时})${re}"
+        fi
+    fi
+    green "=============================================================="
+    echo ""
+}
+
+format_speed_str() {
+    local bps="$1"
+    awk -v b="$bps" 'BEGIN {
+        if (b + 0 <= 0) { printf "0.00 MB/s (0.00 Mbps)" }
+        else { printf "%.2f MB/s (%.2f Mbps)", b / 1048576, (b * 8) / 1000000 }
+    }'
+}
+
+run_speedtest() {
+    echo ""
+    green "================ 服务器轻量级测速 (单线程防OOM) ================"
+    yellow "正在检测最佳测速通道，请稍候 (全程零磁盘写入，约耗时 10-20 秒)..."
+    echo ""
+
+    local doh_args=()
+    local cf_test_code
+    cf_test_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
+    if [ "$cf_test_code" != "200" ]; then
+        local v4_ok v6_ok
+        v4_ok=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 --resolve "dns.google:443:8.8.8.8" --doh-url "https://dns.google/dns-query" "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
+        if [ "$v4_ok" == "200" ]; then
+            doh_args=(--resolve "dns.google:443:8.8.8.8" --doh-url "https://dns.google/dns-query")
+            yellow "提示: 检测到系统 DNS 无法解析 Cloudflare，本次测速已自动借道 Google IPv4 DoH。"
+        else
+            v6_ok=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 --resolve "dns.google:443:2001:4860:4860::8888" --doh-url "https://dns.google/dns-query" "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
+            if [ "$v6_ok" == "200" ]; then
+                doh_args=(--resolve "dns.google:443:2001:4860:4860::8888" --doh-url "https://dns.google/dns-query")
+                yellow "提示: 检测到系统 DNS 无法解析 Cloudflare，本次测速已自动借道 Google IPv6 DoH。"
+            fi
+        fi
+    fi
+
+    # 1. Cloudflare 延迟与下载测速 (20MB，最多12秒)
+    local cf_rtt cf_dl_bps cf_ul_bps
+    cf_rtt=$(curl -s -o /dev/null -w "%{time_starttransfer}" --max-time 5 "${doh_args[@]}" "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
+    cf_rtt_ms=$(awk -v t="${cf_rtt:-0}" 'BEGIN {printf "%.0f", t * 1000}')
+    if [ "${cf_rtt_ms:-0}" -gt 0 ]; then
+        echo -e " Cloudflare 节点延迟   : ${skyblue}${cf_rtt_ms} ms${re}"
+        cf_dl_bps=$(curl -s -o /dev/null -w "%{speed_download}" --max-time 12 "${doh_args[@]}" "https://speed.cloudflare.com/__down?bytes=20000000" 2>/dev/null)
+        echo -e " Cloudflare 单线程下行 : ${green}$(format_speed_str "${cf_dl_bps:-0}")${re}"
+        cf_ul_bps=$(dd if=/dev/zero bs=1048576 count=5 2>/dev/null | curl -s -o /dev/null -w "%{speed_upload}" --max-time 12 "${doh_args[@]}" -X POST --data-binary @- "https://speed.cloudflare.com/__up" 2>/dev/null)
+        echo -e " Cloudflare 单线程上行 : ${green}$(format_speed_str "${cf_ul_bps:-0}")${re}"
+    else
+        echo -e " Cloudflare 测速通道   : ${yellow}连接超时，已跳过${re}"
+    fi
+
+    # 2. CacheFly 备用节点下载测速 (10MB，最多10秒)
+    local cache_dl_bps
+    cache_dl_bps=$(curl -s -o /dev/null -w "%{speed_download}" --max-time 10 "https://cachefly.cachefly.net/10mb.test" 2>/dev/null)
+    if awk -v b="${cache_dl_bps:-0}" 'BEGIN {exit !(b + 0 > 1000)}'; then
+        echo -e " CacheFly   单线程下行 : ${green}$(format_speed_str "${cache_dl_bps:-0}")${re}"
+    else
+        echo -e " CacheFly   单线程下行 : ${yellow}不可达 / 超时${re}"
+    fi
+
+    green "================================================================"
+    echo ""
+}
+
+manage_test_speed_menu() {
+    clear; echo ""
+    green "=== 节点连通性自检与服务器测速 ==="
+    echo ""
+    green "1. 节点运行与连通性自检 (进程 / 端口监听 / 出口状态)"
+    skyblue "--------------------------------------------------------"
+    green "2. 服务器单线程轻量测速 (Cloudflare + CacheFly，防爆内存)"
+    skyblue "--------------------------------------------------------"
+    purple "0. 返回主菜单"
+    skyblue "--------------------------------------------------------"
+    reading "请输入选择: " ts_choice
+    echo ""
+    case "$ts_choice" in
+        1) test_nodes_health ;;
+        2) run_speedtest ;;
         0) need_pause=false; return ;;
         *) red "无效的选项！" ;;
     esac
@@ -1747,7 +1959,6 @@ rebuild_urls() {
         local m_uuid argodomain
         m_uuid=$(jq -r '.inbounds[] | select(.tag == "vmess-ws") | .users[0].uuid' "$inbounds_file")
         argodomain="${ARGO_DOMAIN}"
-        # 若为临时隧道模式，始终优先从 argo.log 提取最新生成的 trycloudflare 域名
         if [ -z "$ARGO_TOKEN" ] && [ -f "${work_dir}/argo.log" ]; then
             local latest_log_dom
             latest_log_dom=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" 2>/dev/null | tail -1)
@@ -1828,7 +2039,6 @@ rebuild_urls() {
 }
 
 check_nodes() {
-    # 查看节点前自动检查 Argo 临时域名是否在后台重启后发生变更
     if proto_exists "vmess-ws" && sync_latest_argo_domain; then
         rebuild_urls >/dev/null 2>&1 || true
     fi
@@ -2199,6 +2409,7 @@ get_info() {
     rebuild_urls
     clear
     green "sing-box 安装并启动成功！(BBR: $(check_bbr_status) | 自动守护: $(check_watchdog_status) | 快捷键: sb)"
+    test_nodes_health
     check_nodes
 }
 
@@ -2746,6 +2957,7 @@ menu() {
     green "10. BBR 加速管理 (开启 / 关闭 BBR 加速通道)"
     green "11. 断联自动重启守护管理 (秒级自启 + 64M防OOM优化)"
     green "12. DNS 加密管理 (开启 DoH 防劫持 / 恢复系统默认 DNS)"
+    green "13. 节点连通性自检与服务器测速 (单线程防爆内存)"
     echo "=========================================================="
     red   "0. 退出脚本"
     echo "=========================================================="
@@ -2789,33 +3001,43 @@ case "$1" in
         exit 0
         ;;
     --doh-on | --doh)
-        enable_doh "${2:-8.8.8.8}"
+        enable_doh "${2:-8.8.8.8}" "${3:-}"
         exit $?
         ;;
     --doh-off)
         disable_doh
         exit $?
         ;;
+    -t | --test)
+        test_nodes_health
+        exit 0
+        ;;
+    -s | --speed)
+        run_speedtest
+        exit 0
+        ;;
     -h | --help)
         echo ""
         green "快捷键用法: sb [参数]"
-        green "  sb                 打开交互式管理菜单"
-        green "  sb -c              直接输出节点 Base64 编码 (自动同步最新Argo域名)"
-        green "  sb --apply-guard   无损启用断联自动重启守护与 64M 防崩溃优化"
-        green "  sb -w              执行一次进程存活看门狗巡检"
-        green "  sb -boff           直接关闭 BBR 加速通道 (或 sb --bbr-off)"
-        green "  sb -bon            直接开启 BBR 加速通道 (或 sb --bbr-on)"
-        green "  sb --doh-on [IP]   开启加密 DoH (默认 8.8.8.8，可指定 1.1.1.1 等纯IP)"
-        green "  sb --doh-off       恢复系统默认 DNS (local)"
-        green "  sb -r              重启服务、刷新 Argo 临时域名并输出 Base64"
-        green "  sb -u              直接彻底卸载并恢复初始状态"
+        green "  sb                   打开交互式管理菜单"
+        green "  sb -c                直接输出节点 Base64 编码 (自动同步最新Argo域名)"
+        green "  sb -t                执行节点运行与连通性自检"
+        green "  sb -s                执行服务器单线程轻量测速"
+        green "  sb --apply-guard     无损启用断联自动重启守护与 64M 防崩溃优化"
+        green "  sb -w                执行一次进程存活看门狗巡检"
+        green "  sb -boff             直接关闭 BBR 加速通道 (或 sb --bbr-off)"
+        green "  sb -bon              直接开启 BBR 加速通道 (或 sb --bbr-on)"
+        green "  sb --doh-on [IP]     开启加密 DoH (默认 8.8.8.8，自动匹配 Host/SNI)"
+        green "  sb --doh-off         恢复系统默认 DNS (local)"
+        green "  sb -r                重启服务、刷新 Argo 临时域名并输出 Base64"
+        green "  sb -u                直接彻底卸载并恢复初始状态"
         echo ""
         exit 0
         ;;
     "")
         while true; do
             menu
-            reading "请输入选择 (0-12): " choice
+            reading "请输入选择 (0-13): " choice
             echo ""
             need_pause=true
             case "${choice}" in
@@ -2857,8 +3079,9 @@ case "$1" in
                 10) manage_bbr_menu;         need_pause=true ;;
                 11) manage_watchdog_menu;    need_pause=true ;;
                 12) manage_dns_menu;         need_pause=true ;;
+                13) manage_test_speed_menu;  need_pause=true ;;
                 0)  exit 0 ;;
-                *)  red "无效的选项，请输入 0-12"; need_pause=true ;;
+                *)  red "无效的选项，请输入 0-13"; need_pause=true ;;
             esac
             [ "$need_pause" = true ] && read -n 1 -s -r -p $'\033[1;91m按任意键返回主菜单...\033[0m'
         done
