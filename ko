@@ -15,8 +15,8 @@ if [ "$0" != "/etc/sing-box/sb.sh" ] && [ "$0" != "/usr/bin/sb" ] && [ "$0" != "
 #!/usr/bin/env bash
 
 # =========================
-# sing-box 64M极简低内存多协议脚本 (自动守护 + 防OOM + DoH防劫持 + 自检与测速版)
-# 支持协议: vless-reality | vmess-ws(argo) | hysteria2 | tuic5 | anytls | socks5 | ss2022
+# sing-box 64M极简低内存多协议脚本 (AnyTLS-Reality抗探测 + 双层守护全记录 + DoH防劫持 + 自检测速版)
+# 支持协议: vless-reality | vmess-ws(argo) | hysteria2 | tuic5 | anytls(reality/cert) | socks5 | ss2022
 # =========================
 
 export LANG=en_US.UTF-8
@@ -68,6 +68,11 @@ rand_port() {
     shuf -i 10000-60000 -n 1 2>/dev/null || echo $(( (RANDOM % 50000) + 10000 ))
 }
 
+# 生成 8 位十六进制 Reality Short ID
+rand_hex8() {
+    openssl rand -hex 4 2>/dev/null || head -c 4 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo "a1b2c3d4"
+}
+
 # 确保 sb 软链接始终存在
 ensure_sb_links() {
     chmod +x "${work_dir}/sb.sh" 2>/dev/null || true
@@ -94,6 +99,28 @@ save_meta() {
 
 load_meta() {
     [ -f "$meta_file" ] && source "$meta_file"
+}
+
+# 确保 Reality 密钥对存在
+ensure_reality_keypair() {
+    load_meta
+    if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+        if [ ! -x "${work_dir}/${server_name}" ]; then
+            red "错误: 未找到 sing-box 主程序，无法生成 Reality 密钥对！"
+            return 1
+        fi
+        local kp_out
+        kp_out=$("${work_dir}/${server_name}" generate reality-keypair 2>/dev/null)
+        PRIVATE_KEY=$(echo "$kp_out" | awk '/PrivateKey:/ {print $2}')
+        PUBLIC_KEY=$(echo "$kp_out" | awk '/PublicKey:/ {print $2}')
+        if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+            red "错误: 生成 Reality 密钥对失败！"
+            return 1
+        fi
+        save_meta "PRIVATE_KEY" "$PRIVATE_KEY"
+        save_meta "PUBLIC_KEY" "$PUBLIC_KEY"
+    fi
+    return 0
 }
 
 # 实时从 argo.log 提取最新临时域名并同步至 meta.conf
@@ -260,7 +287,7 @@ EOF
 }
 
 # =========================
-# 断联自动重启守护 (看门狗模块 - 零常驻内存占用)
+# 断联自动重启守护 (看门狗模块 + 第一层秒级重启 PID 追踪，零常驻内存)
 # =========================
 check_watchdog_raw() {
     if crontab -l 2>/dev/null | grep -q "/usr/bin/sb -w"; then
@@ -304,6 +331,7 @@ enable_watchdog() {
         systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1 || true
     fi
     save_meta "WATCHDOG_ENABLED" "1"
+    init_pid_baselines
 }
 
 disable_watchdog() {
@@ -325,24 +353,131 @@ log_watchdog_event() {
     fi
 }
 
-# 精确检测目标二进制进程是否真实存活 (排除 supervise-daemon 外壳与僵尸进程)
-is_process_alive() {
+get_pid_state_file() {
+    case "$1" in
+        sing-box) echo "${work_dir}/.sb_last_pid" ;;
+        argo)     echo "${work_dir}/.argo_last_pid" ;;
+        *)        echo "" ;;
+    esac
+}
+
+# 精确获取存活进程 PID (排除 supervise-daemon 外壳与僵尸进程，兼容 Alpine/Debian)
+get_live_pid() {
     local bin_path="$1"
     local proc_name="$2"
+    local pid
+
     if command_exists pidof; then
-        local pid
         for pid in $(pidof "$proc_name" 2>/dev/null); do
             if [ -r "/proc/${pid}/stat" ]; then
-                grep -q ") Z" "/proc/${pid}/stat" 2>/dev/null || return 0
-            else
-                return 0
+                grep -q ") Z" "/proc/${pid}/stat" 2>/dev/null && continue
             fi
+            echo "$pid"
+            return 0
         done
     fi
+
     if command_exists pgrep; then
-        pgrep -x "$proc_name" >/dev/null 2>&1 && return 0
+        for pid in $(pgrep -x "$proc_name" 2>/dev/null); do
+            if [ -r "/proc/${pid}/stat" ]; then
+                grep -q ") Z" "/proc/${pid}/stat" 2>/dev/null && continue
+            fi
+            echo "$pid"
+            return 0
+        done
     fi
-    ps -ef 2>/dev/null | grep -v grep | grep -v "supervise-daemon" | grep -v "/bin/sh" | grep -q "$bin_path" && return 0
+
+    local pdir comm
+    for pdir in /proc/[0-9]*; do
+        [ -r "${pdir}/comm" ] || continue
+        pid="${pdir#/proc/}"
+        comm=$(cat "${pdir}/comm" 2>/dev/null)
+        if [ "$comm" = "$proc_name" ]; then
+            if [ -r "${pdir}/stat" ] && grep -q ") Z" "${pdir}/stat" 2>/dev/null; then
+                continue
+            fi
+            echo "$pid"
+            return 0
+        fi
+    done
+    return 1
+}
+
+is_process_alive() {
+    get_live_pid "$1" "$2" >/dev/null 2>&1
+}
+
+record_service_pid() {
+    local service_name="$1"
+    local svc_bin state_file pid _w=0
+    svc_bin=$(get_service_file "$service_name")
+    state_file=$(get_pid_state_file "$service_name")
+    [ -z "$svc_bin" ] || [ -z "$state_file" ] && return 0
+
+    mkdir -p "$work_dir"
+    while [ "$_w" -lt 15 ]; do
+        pid=$(get_live_pid "$svc_bin" "$service_name")
+        if [ -n "$pid" ]; then
+            echo "$pid" > "$state_file"
+            return 0
+        fi
+        sleep 0.1
+        _w=$((_w + 1))
+    done
+    return 1
+}
+
+clear_service_pid() {
+    local state_file
+    state_file=$(get_pid_state_file "$1")
+    [ -n "$state_file" ] && rm -f "$state_file"
+}
+
+init_pid_baselines() {
+    local svc state_file svc_bin cur_pid
+    for svc in sing-box argo; do
+        state_file=$(get_pid_state_file "$svc")
+        svc_bin=$(get_service_file "$svc")
+        if [ -n "$state_file" ] && [ ! -f "$state_file" ] && [ -x "$svc_bin" ]; then
+            cur_pid=$(get_live_pid "$svc_bin" "$svc")
+            if [ -n "$cur_pid" ]; then
+                mkdir -p "$work_dir"
+                echo "$cur_pid" > "$state_file"
+            fi
+        fi
+    done
+}
+
+# 检测第一层守护 (supervise-daemon / systemd) 是否已完成秒级重启并记录日志
+check_layer1_respawn() {
+    local service_name="$1"
+    local svc_bin state_file cur_pid last_pid respawn_time
+    svc_bin=$(get_service_file "$service_name")
+    state_file=$(get_pid_state_file "$service_name")
+    [ -z "$svc_bin" ] || [ -z "$state_file" ] && return 1
+
+    cur_pid=$(get_live_pid "$svc_bin" "$service_name")
+    [ -z "$cur_pid" ] && return 1
+
+    if [ -f "$state_file" ]; then
+        last_pid=$(tr -d ' \t\r\n' < "$state_file" 2>/dev/null)
+        if [ -n "$last_pid" ] && [ "$last_pid" != "$cur_pid" ]; then
+            echo "$cur_pid" > "$state_file"
+            respawn_time=""
+            if [ -d "/proc/${cur_pid}" ]; then
+                respawn_time=$(date -r "/proc/${cur_pid}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
+            fi
+            if [ -n "$respawn_time" ]; then
+                log_watchdog_event "[第一层秒级守护] 检测到 ${service_name} 异常退出后已自动秒级重启 (PID: ${last_pid} -> ${cur_pid} | 拉起时间: ${respawn_time})。"
+            else
+                log_watchdog_event "[第一层秒级守护] 检测到 ${service_name} 异常退出后已自动秒级重启 (PID: ${last_pid} -> ${cur_pid})。"
+            fi
+            return 0
+        fi
+    else
+        mkdir -p "$work_dir"
+        echo "$cur_pid" > "$state_file"
+    fi
     return 1
 }
 
@@ -353,7 +488,11 @@ run_watchdog() {
     if [ -x "${work_dir}/${server_name}" ] && is_service_registered "sing-box"; then
         if ! is_process_alive "${work_dir}/${server_name}" "sing-box"; then
             restart_singbox >/dev/null 2>&1 || true
-            log_watchdog_event "检测到 sing-box 进程异常/OOM退出，已自动拉起重启。"
+            local new_sb_pid
+            new_sb_pid=$(get_live_pid "${work_dir}/${server_name}" "sing-box")
+            log_watchdog_event "[第二层定时巡检] 检测到 sing-box 进程异常/OOM退出，已由看门狗自动拉起重启${new_sb_pid:+ (新PID: ${new_sb_pid})}。"
+        else
+            check_layer1_respawn "sing-box" >/dev/null 2>&1 || true
         fi
     fi
 
@@ -366,15 +505,20 @@ run_watchdog() {
             else
                 restart_argo >/dev/null 2>&1 || true
             fi
-            log_watchdog_event "检测到 Argo 隧道进程异常退出，已自动拉起重启并刷新订阅。"
-        elif [ -z "$ARGO_TOKEN" ]; then
-            if sync_latest_argo_domain; then
-                rebuild_urls >/dev/null 2>&1 || true
-                log_watchdog_event "检测到 Argo 重启后临时域名变更为 ${ARGO_DOMAIN}，已自动更新节点订阅。"
-            elif [ -f "${work_dir}/argo.log" ] && ! grep -q "trycloudflare\.com" "${work_dir}/argo.log" 2>/dev/null; then
-                get_quick_tunnel >/dev/null 2>&1 || true
-                rebuild_urls >/dev/null 2>&1 || true
-                log_watchdog_event "检测到 Argo 临时域名缺失，已重新握手获取新域名。"
+            local new_argo_pid
+            new_argo_pid=$(get_live_pid "${work_dir}/argo" "argo")
+            log_watchdog_event "[第二层定时巡检] 检测到 Argo 隧道进程异常退出，已自动拉起重启并刷新订阅${new_argo_pid:+ (新PID: ${new_argo_pid})}。"
+        else
+            check_layer1_respawn "argo" >/dev/null 2>&1 || true
+            if [ -z "$ARGO_TOKEN" ]; then
+                if sync_latest_argo_domain; then
+                    rebuild_urls >/dev/null 2>&1 || true
+                    log_watchdog_event "[Argo域名同步] 检测到 Argo 重启后临时域名变更为 ${ARGO_DOMAIN}，已自动更新节点订阅。"
+                elif [ -f "${work_dir}/argo.log" ] && ! grep -q "trycloudflare\.com" "${work_dir}/argo.log" 2>/dev/null; then
+                    get_quick_tunnel >/dev/null 2>&1 || true
+                    rebuild_urls >/dev/null 2>&1 || true
+                    log_watchdog_event "[第二层定时巡检] 检测到 Argo 临时域名缺失，已重新握手获取新域名。"
+                fi
             fi
         fi
     fi
@@ -404,7 +548,7 @@ apply_guard_and_optimize() {
         alpine_openrc_services
     fi
     enable_watchdog
-    green "已成功开启双重自动重启守护 (OpenRC/Systemd 进程守护 + 每分钟看门狗巡检)！"
+    green "已成功开启双重自动重启守护 (OpenRC/Systemd 秒级守护 + 每分钟看门狗巡检，双层重启均自动记入日志)！"
 }
 
 manage_watchdog_menu() {
@@ -415,7 +559,9 @@ manage_watchdog_menu() {
     skyblue "------------------------------------------------"
     red   "2. 关闭定时看门狗巡检"
     skyblue "------------------------------------------------"
-    purple "3. 查看最近自动重启日志"
+    purple "3. 查看最近自动重启日志 (含第一层秒级重启记录)"
+    skyblue "------------------------------------------------"
+    yellow "4. 清空自动重启日志"
     skyblue "------------------------------------------------"
     purple "0. 返回主菜单"
     skyblue "------------------------------------------------"
@@ -425,12 +571,18 @@ manage_watchdog_menu() {
         1) apply_guard_and_optimize ;;
         2) disable_watchdog && yellow "已关闭定时看门狗巡检。" ;;
         3)
+            check_layer1_respawn "sing-box" >/dev/null 2>&1 || true
+            proto_exists "vmess-ws" && check_layer1_respawn "argo" >/dev/null 2>&1 || true
             if [ -s "$watchdog_log" ]; then
                 green "=== 最近自动重启记录 ==="
                 cat "$watchdog_log"
             else
                 yellow "暂无异常重启记录，节点运行正常。"
             fi
+            ;;
+        4)
+            : > "$watchdog_log" 2>/dev/null || true
+            green "已清空自动重启日志。"
             ;;
         0) need_pause=false; return ;;
         *) red "无效的选项！" ;;
@@ -511,7 +663,7 @@ kill_service_residual() {
 manage_service() {
     local service_name="$1"
     local action="$2"
-    local status
+    local status rc=0
     status=$(check_service_raw "$service_name")
 
     if [ "$action" == "start" ] || [ "$action" == "restart" ]; then
@@ -522,16 +674,24 @@ manage_service() {
 
     case "$action" in
         "start")
-            [ "$status" == "running" ] && return 0
+            if [ "$status" == "running" ]; then
+                [ ! -f "$(get_pid_state_file "$service_name")" ] && record_service_pid "$service_name" >/dev/null 2>&1 || true
+                return 0
+            fi
             [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装!\n"; return 1; }
             if command_exists rc-service; then
                 rc-service "$service_name" zap >/dev/null 2>&1 || true
                 rc-service "$service_name" start >/dev/null 2>&1
+                rc=$?
             elif command_exists systemctl; then
                 systemctl daemon-reload && systemctl start "$service_name" >/dev/null 2>&1
+                rc=$?
             fi
+            [ "$rc" -eq 0 ] && record_service_pid "$service_name" >/dev/null 2>&1 || true
+            return "$rc"
             ;;
         "stop")
+            clear_service_pid "$service_name"
             [ "$status" == "not installed" ] && return 0
             if command_exists rc-service; then
                 rc-service "$service_name" stop >/dev/null 2>&1 || true
@@ -548,9 +708,13 @@ manage_service() {
                 rc-service "$service_name" zap >/dev/null 2>&1 || true
                 kill_service_residual "$service_name"
                 rc-service "$service_name" start >/dev/null 2>&1
+                rc=$?
             elif command_exists systemctl; then
                 systemctl daemon-reload && systemctl restart "$service_name" >/dev/null 2>&1
+                rc=$?
             fi
+            [ "$rc" -eq 0 ] && record_service_pid "$service_name" >/dev/null 2>&1 || true
+            return "$rc"
             ;;
     esac
 }
@@ -942,6 +1106,26 @@ manage_dns_menu() {
 # =========================
 # 节点连通性自检与 64M 轻量级测速模块
 # =========================
+get_anytls_mode_label() {
+    local inbounds_file="${conf_dir}/inbounds.json"
+    if [ ! -f "$inbounds_file" ] || ! command_exists jq || ! proto_exists "anytls"; then
+        echo ""
+        return
+    fi
+    local is_reality cert_path
+    is_reality=$(jq -r '.inbounds[] | select(.tag == "anytls") | .tls.reality.enabled // false' "$inbounds_file" 2>/dev/null)
+    if [ "$is_reality" == "true" ]; then
+        echo "Reality 强伪装"
+        return
+    fi
+    cert_path=$(jq -r '.inbounds[] | select(.tag == "anytls") | .tls.certificate_path // empty' "$inbounds_file" 2>/dev/null)
+    if [ -n "$cert_path" ] && [ "$cert_path" != "${work_dir}/cert.pem" ]; then
+        echo "真实域名证书"
+    else
+        echo "自签证书-易被风控"
+    fi
+}
+
 test_nodes_health() {
     echo ""
     green "==================== 节点运行与连通性自检 ===================="
@@ -1011,6 +1195,23 @@ test_nodes_health() {
             echo -e " 5. Cloudflare 测速口  : ${yellow}暂不可达 (HTTP ${cf_code:-超时})${re}"
         fi
     fi
+
+    local risk_notes=()
+    if proto_exists "anytls" && [ "$(get_anytls_mode_label)" == "自签证书-易被风控" ]; then
+        risk_notes+=("AnyTLS 仍在使用自签假证书 (建议进菜单 6 -> 7 升级为 Reality)")
+    fi
+    if proto_exists "socks5-in"; then
+        risk_notes+=("公网启用了明文 Socks5 (易被母机扫描告警，建议进菜单 4 删除)")
+    fi
+    if [ "${#risk_notes[@]}" -eq 0 ]; then
+        echo -e " 6. 抗探测合规检查     : ${green}通过 (无公网明文协议或 TCP 自签伪装)${re}"
+    else
+        echo -e " 6. 抗探测合规检查     : ${yellow}存在风控告警风险${re}"
+        local note
+        for note in "${risk_notes[@]}"; do
+            echo -e "    - ${yellow}${note}${re}"
+        done
+    fi
     green "=============================================================="
     echo ""
 }
@@ -1076,7 +1277,7 @@ manage_test_speed_menu() {
     clear; echo ""
     green "=== 节点连通性自检与服务器测速 ==="
     echo ""
-    green "1. 节点运行与连通性自检 (进程 / 端口监听 / 出口状态)"
+    green "1. 节点运行与连通性自检 (进程 / 端口监听 / 出口与合规状态)"
     skyblue "--------------------------------------------------------"
     green "2. 服务器单线程轻量测速 (Cloudflare + CacheFly，防爆内存)"
     skyblue "--------------------------------------------------------"
@@ -1153,8 +1354,12 @@ detect_ipv6() {
 
 format_region_label() {
     local raw_code="$1"
+    local code_part="$raw_code"
+    if [[ "$raw_code" =~ ^([A-Za-z]{2,3})[-_] ]]; then
+        code_part="${BASH_REMATCH[1]}"
+    fi
     local upper_code
-    upper_code=$(printf '%s' "$raw_code" | tr '[:lower:]' '[:upper:]')
+    upper_code=$(printf '%s' "$code_part" | tr '[:lower:]' '[:upper:]')
     case "$upper_code" in
         HK|HKG)       echo "香港🇭🇰" ;;
         TW|TWN)       echo "台湾🇹🇼" ;;
@@ -1446,15 +1651,15 @@ is_system_port_used() {
 
     if command_exists ss; then
         case "$trans" in
-            tcp|local) ss -tln 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0 ;;
-            udp)       ss -uln 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0 ;;
-            *)         ss -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "(:|\])${p}$" && return 0 ;;
+            tcp|local) ss -tln 2>/dev/null | awk -v pat=":${p}$" '$4 ~ pat {found=1} END {exit !found}' && return 0 ;;
+            udp)       ss -uln 2>/dev/null | awk -v pat=":${p}$" '$4 ~ pat {found=1} END {exit !found}' && return 0 ;;
+            *)         ss -tuln 2>/dev/null | awk -v pat=":${p}$" '$5 ~ pat {found=1} END {exit !found}' && return 0 ;;
         esac
     elif command_exists netstat; then
         case "$trans" in
-            tcp|local) netstat -tl 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0 ;;
-            udp)       netstat -ul 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0 ;;
-            *)         netstat -tul 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0 ;;
+            tcp|local) netstat -tln 2>/dev/null | awk -v pat=":${p}$" '$4 ~ pat {found=1} END {exit !found}' && return 0 ;;
+            udp)       netstat -uln 2>/dev/null | awk -v pat=":${p}$" '$4 ~ pat {found=1} END {exit !found}' && return 0 ;;
+            *)         netstat -tuln 2>/dev/null | awk -v pat=":${p}$" '$4 ~ pat {found=1} END {exit !found}' && return 0 ;;
         esac
     elif command_exists lsof; then
         if [ "$trans" == "tcp" ] || [ "$trans" == "local" ]; then
@@ -1474,12 +1679,16 @@ is_port_owned_by_singbox() {
 
     if command_exists ss; then
         case "$trans" in
-            tcp|local) ss -tlnp 2>/dev/null | awk '{print $4, $6}' | grep -Eq "(:|\])${p}([[:space:]]|\$)" | grep -q "sing-box" && return 0 ;;
-            udp)       ss -ulnp 2>/dev/null | awk '{print $4, $6}' | grep -Eq "(:|\])${p}([[:space:]]|\$)" | grep -q "sing-box" && return 0 ;;
-            *)         ss -tulnp 2>/dev/null | awk '{print $5, $7}' | grep -Eq "(:|\])${p}([[:space:]]|\$)" | grep -q "sing-box" && return 0 ;;
+            tcp|local) ss -tlnp 2>/dev/null | awk -v pat=":${p}$" '$4 ~ pat' | grep -q "sing-box" && return 0 ;;
+            udp)       ss -ulnp 2>/dev/null | awk -v pat=":${p}$" '$4 ~ pat' | grep -q "sing-box" && return 0 ;;
+            *)         ss -tulnp 2>/dev/null | awk -v pat=":${p}$" '$5 ~ pat' | grep -q "sing-box" && return 0 ;;
         esac
     elif command_exists netstat; then
-        netstat -tulnp 2>/dev/null | grep -Eq "(:|\])${p}[[:space:]]" | grep -q "sing-box" && return 0
+        case "$trans" in
+            tcp|local) netstat -tlnp 2>/dev/null | awk -v pat=":${p}$" '$4 ~ pat' | grep -q "sing-box" && return 0 ;;
+            udp)       netstat -ulnp 2>/dev/null | awk -v pat=":${p}$" '$4 ~ pat' | grep -q "sing-box" && return 0 ;;
+            *)         netstat -tulnp 2>/dev/null | awk -v pat=":${p}$" '$4 ~ pat' | grep -q "sing-box" && return 0 ;;
+        esac
     elif command_exists lsof; then
         lsof -i :"$p" 2>/dev/null | grep -q "sing-box" && return 0
     fi
@@ -1674,6 +1883,115 @@ EOF
 }
 
 # =========================
+# AnyTLS 伪装 TLS 配置构造 (Reality / 真实证书 / 自签兼容)
+# =========================
+prompt_anytls_tls_config() {
+    local interactive="${1:-1}"
+    load_meta
+    ANYTLS_TLS_JSON=""
+    local mode_choice="1"
+
+    if [ "$interactive" -eq 1 ]; then
+        echo ""
+        green "=== 选择 AnyTLS TLS 伪装模式 (解决自签证书被母机风控告警) ==="
+        green "  1. Reality 强伪装模式  (默认推荐，免域名免证书，返回真实大站证书抗探测)"
+        green "  2. 真实域名有效证书    (自有域名 + CA有效证书路径，100% 兼容所有客户端)"
+        yellow "  3. 旧版自签证书模式    (不推荐，暴露 bing.com 假证书易触发母机告警)"
+        skyblue "--------------------------------------------------------"
+        reading "请选择 AnyTLS 伪装模式 (1-3，直接回车默认选 1 Reality): " mode_choice
+        mode_choice="${mode_choice:-1}"
+    fi
+
+    case "$mode_choice" in
+        2)
+            local dom cert_p key_p
+            reading "请输入已解析到本机的真实域名 (SNI): " dom
+            reading "请输入有效证书公钥路径 (如 /etc/ssl/fullchain.pem): " cert_p
+            reading "请输入有效证书私钥路径 (如 /etc/ssl/privkey.pem): " key_p
+            if [ -z "$dom" ] || [ ! -r "$cert_p" ] || [ ! -r "$key_p" ]; then
+                red "错误: 域名为空或证书/私钥文件不存在且不可读！"
+                return 1
+            fi
+            save_meta "ANYTLS_MODE" "cert"
+            save_meta "ANYTLS_DOMAIN" "$dom"
+            save_meta "ANYTLS_CERT" "$cert_p"
+            save_meta "ANYTLS_KEY" "$key_p"
+            ANYTLS_TLS_JSON=$(jq -cn --arg sni "$dom" --arg cert "$cert_p" --arg key "$key_p" '{
+                "enabled": true,
+                "server_name": $sni,
+                "certificate_path": $cert,
+                "key_path": $key
+            }')
+            green " -> AnyTLS 已配置为 [真实域名有效证书: ${dom}]"
+            ;;
+        3)
+            save_meta "ANYTLS_MODE" "selfsigned"
+            ANYTLS_TLS_JSON=$(jq -cn --arg cert "${work_dir}/cert.pem" --arg key "${work_dir}/private.key" '{
+                "enabled": true,
+                "certificate_path": $cert,
+                "key_path": $key
+            }')
+            yellow " -> AnyTLS 已配置为 [自签证书模式] (注意: 可能触发母机弱协议扫描告警)"
+            ;;
+        *)
+            ensure_reality_keypair || return 1
+            local sni="${REALITY_SNI:-www.iij.ad.jp}"
+            if [ "$interactive" -eq 1 ]; then
+                reading "请输入 AnyTLS Reality 伪装域名 (回车默认 ${sni}): " input_sni
+                [ -n "$input_sni" ] && sni="$input_sni"
+            fi
+            local sid="${ANYTLS_SID:-$(rand_hex8)}"
+            save_meta "ANYTLS_MODE" "reality"
+            save_meta "REALITY_SNI" "$sni"
+            save_meta "ANYTLS_SID" "$sid"
+            ANYTLS_TLS_JSON=$(jq -cn --arg sni "$sni" --arg pk "$PRIVATE_KEY" --arg sid "$sid" '{
+                "enabled": true,
+                "server_name": $sni,
+                "reality": {
+                    "enabled": true,
+                    "handshake": {"server": $sni, "server_port": 443},
+                    "private_key": $pk,
+                    "short_id": [$sid, ""]
+                }
+            }')
+            green " -> AnyTLS 已配置为 [Reality 强伪装: ${sni} | sid: ${sid}]"
+            ;;
+    esac
+    return 0
+}
+
+upgrade_anytls_tls() {
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local bak_file="${work_dir}/inbounds.json.bak"
+    if ! proto_exists "anytls"; then
+        red "\n当前未启用 AnyTLS 协议，请先在 [4. 协议节点管理] 中添加 AnyTLS！\n"
+        return 1
+    fi
+
+    echo -e "\n当前 AnyTLS 伪装模式: ${skyblue}$(get_anytls_mode_label)${re}"
+    prompt_anytls_tls_config 1 || return 1
+
+    cp -f "$inbounds_file" "$bak_file"
+    jq --argjson tls "$ANYTLS_TLS_JSON" \
+       '(.inbounds[] | select(.tag == "anytls") | .tls) = $tls' \
+       "$inbounds_file" > "${work_dir}/inbounds.json.tmp" && mv -f "${work_dir}/inbounds.json.tmp" "$inbounds_file"
+
+    local check_err
+    if ! check_err=$("${work_dir}/${server_name}" check -C "${conf_dir}" 2>&1); then
+        red "sing-box 配置校验失败，已自动回滚原 AnyTLS 配置！"
+        [ -n "$check_err" ] && yellow "错误详情: ${check_err}"
+        mv -f "$bak_file" "$inbounds_file"
+        return 1
+    fi
+    rm -f "$bak_file"
+
+    restart_singbox
+    rebuild_urls
+    green "\nAnyTLS 伪装模式已切换并生效！请复制下方最新 Base64 重新导入客户端："
+    check_nodes
+}
+
+# =========================
 # 协议管理底层逻辑
 # =========================
 proto_exists() {
@@ -1693,6 +2011,7 @@ add_proto_to_inbounds() {
             if proto_exists "vless-reality"; then
                 yellow "vless-reality 已存在，跳过添加。"; return 0
             fi
+            ensure_reality_keypair || return 1
             local def_port="${VLESS_PORT:-$(rand_port)}"
             if [ "$interactive" -eq 1 ]; then
                 prompt_custom_port "VLESS-Reality (TCP)" "$def_port" "vless-reality" "tcp"
@@ -1834,24 +2153,20 @@ add_proto_to_inbounds() {
                 prompt_custom_port "AnyTLS (TCP)" "$def_port" "anytls" "tcp"
                 def_port="$Selected_Port"
             fi
+            prompt_anytls_tls_config "$interactive" || return 1
             save_meta "ANYTLS_PORT" "$def_port"
 
             jq --arg listen "$listen_ip" \
                --argjson port "$def_port" \
                --arg pass "$UUID" \
-               --arg cert "${work_dir}/cert.pem" \
-               --arg key "${work_dir}/private.key" \
+               --argjson tls "$ANYTLS_TLS_JSON" \
                '.inbounds += [{
                    "type": "anytls",
                    "tag": "anytls",
                    "listen": $listen,
                    "listen_port": $port,
                    "users": [{"password": $pass}],
-                   "tls": {
-                       "enabled": true,
-                       "certificate_path": $cert,
-                       "key_path": $key
-                   }
+                   "tls": $tls
                }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
             allow_port "${def_port}/tcp"
             ;;
@@ -1864,6 +2179,7 @@ add_proto_to_inbounds() {
             local sk_user="${SOCKS_USER:-${UUID:0:8}}"
             local sk_pass="${SOCKS_PASS:-${UUID: -12}}"
             if [ "$interactive" -eq 1 ]; then
+                yellow "提示: 明文 Socks5 直接暴露公网极易触发母机风控告警，建议仅在明确允许的环境使用。"
                 prompt_custom_port "Socks5 (TCP+UDP)" "$def_port" "socks5-in" "both"
                 def_port="$Selected_Port"
                 reading "请输入 Socks5 用户名 (直接回车默认 ${sk_user}): " input_u
@@ -2080,12 +2396,23 @@ rebuild_urls() {
     fi
 
     if proto_exists "anytls"; then
-        local a_port a_pass remark
+        local a_port a_pass a_is_reality a_sni a_sid a_cert remark
         a_port=$(jq -r '.inbounds[] | select(.tag == "anytls") | .listen_port' "$inbounds_file")
         a_pass=$(jq -r '.inbounds[] | select(.tag == "anytls") | .users[0].password' "$inbounds_file")
+        a_is_reality=$(jq -r '.inbounds[] | select(.tag == "anytls") | .tls.reality.enabled // false' "$inbounds_file")
+        a_sni=$(jq -r '.inbounds[] | select(.tag == "anytls") | .tls.server_name // empty' "$inbounds_file")
+        a_sid=$(jq -r '.inbounds[] | select(.tag == "anytls") | .tls.reality.short_id[0] // empty' "$inbounds_file")
+        a_cert=$(jq -r '.inbounds[] | select(.tag == "anytls") | .tls.certificate_path // empty' "$inbounds_file")
+
         for idx in "${!addr_list[@]}"; do
             remark=$(build_node_remark "$region" "${stack_list[$idx]}" "anytls")
-            echo "anytls://${a_pass}@${addr_list[$idx]}:${a_port}?insecure=1&sni=bing.com#${remark}" >> "$client_dir"
+            if [ "$a_is_reality" == "true" ]; then
+                echo "anytls://${a_pass}@${addr_list[$idx]}:${a_port}/?security=reality&sni=${a_sni:-${REALITY_SNI:-www.iij.ad.jp}}&fp=firefox&pbk=${PUBLIC_KEY}${a_sid:+&sid=${a_sid}}#${remark}" >> "$client_dir"
+            elif [ -n "$a_cert" ] && [ "$a_cert" != "${work_dir}/cert.pem" ] && [ -n "$a_sni" ]; then
+                echo "anytls://${a_pass}@${addr_list[$idx]}:${a_port}/?sni=${a_sni}&insecure=0#${remark}" >> "$client_dir"
+            else
+                echo "anytls://${a_pass}@${addr_list[$idx]}:${a_port}/?insecure=1&sni=${a_sni:-bing.com}#${remark}" >> "$client_dir"
+            fi
         done
     fi
 
@@ -2140,15 +2467,15 @@ check_nodes() {
 select_install_protocols() {
     echo ""
     purple "=== 选择要生成的协议节点 (支持多选) ==="
-    green "  1. vless-reality       (极低内存，TCP直连)"
+    green "  1. vless-reality       (极低内存，TCP强伪装抗探测)"
     green "  2. vmess-ws + Argo隧道 (套CF隧道，需运行argo进程约占20M内存)"
     green "  3. hysteria2           (UDP高速协议)"
     green "  4. tuic v5             (UDP低延迟协议)"
-    green "  5. AnyTLS              (新式TLS伪装协议)"
-    green "  6. Socks5              (基础代理协议)"
+    green "  5. AnyTLS              (默认 Reality 强伪装，抗探测免自签告警)"
+    yellow "  6. Socks5              (明文代理，公网暴露易触发母机风控，慎用)"
     green "  7. Shadowsocks-2022    (轻量级SS2022加密协议)"
     skyblue "--------------------------------------------------------"
-    yellow "提示: 多个协议请用空格或逗号隔开 (例如: 1 3 或 1,3,7)"
+    yellow "提示: 多个协议请用空格或逗号隔开 (例如: 1 3 5 或 1,3,7)"
     yellow "      直接回车默认生成 [1 3 4] (vless + hy2 + tuic，免Argo极省内存)"
     reading "请输入协议编号 (回车默认 1 3 4): " proto_input
 
@@ -2350,12 +2677,15 @@ EOF
     systemctl daemon-reload
     systemctl enable sing-box >/dev/null 2>&1
     systemctl restart sing-box
+    record_service_pid "sing-box" >/dev/null 2>&1 || true
 
     load_meta
     if proto_exists "vmess-ws" && [ "${ARGO_STOPPED:-0}" != "1" ]; then
         systemctl enable argo >/dev/null 2>&1
         systemctl restart argo
+        record_service_pid "argo" >/dev/null 2>&1 || true
     else
+        clear_service_pid "argo"
         systemctl stop argo >/dev/null 2>&1 || true
         systemctl disable argo >/dev/null 2>&1 || true
         kill_service_residual "argo"
@@ -2431,6 +2761,7 @@ EOF
     rc-service sing-box zap >/dev/null 2>&1 || true
     kill_service_residual "sing-box"
     rc-service sing-box start >/dev/null 2>&1
+    record_service_pid "sing-box" >/dev/null 2>&1 || true
 
     load_meta
     if proto_exists "vmess-ws" && [ "${ARGO_STOPPED:-0}" != "1" ]; then
@@ -2439,7 +2770,9 @@ EOF
         rc-service argo zap >/dev/null 2>&1 || true
         kill_service_residual "argo"
         rc-service argo start >/dev/null 2>&1
+        record_service_pid "argo" >/dev/null 2>&1 || true
     else
+        clear_service_pid "argo"
         rc-service argo stop >/dev/null 2>&1 || true
         rc-service argo zap >/dev/null 2>&1 || true
         kill_service_residual "argo"
@@ -2565,9 +2898,12 @@ show_all_proto_status() {
         local tag="${item%%:*}"
         local name="${item##*:}"
         if proto_exists "$tag"; then
-            local p
+            local p extra=""
             p=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .listen_port' "$inbounds_file")
-            printf " %d. %-18s : ${green}已启用${re} (端口: ${skyblue}%s${re})\n" "$idx" "$name" "$p"
+            if [ "$tag" == "anytls" ]; then
+                extra=" | $(get_anytls_mode_label)"
+            fi
+            printf " %d. %-18s : ${green}已启用${re} (端口: ${skyblue}%s${re}%s)\n" "$idx" "$name" "$p" "$extra"
         else
             printf " %d. %-18s : ${yellow}未启用 / 已删除${re}\n" "$idx" "$name"
         fi
@@ -2600,7 +2936,7 @@ manage_protocols() {
         1)
             green "请选择要【恢复 / 添加】的协议 (多个编号用空格隔开，如: 1 3):"
             echo "  1. vless-reality   2. vmess-ws(Argo)   3. hysteria2   4. tuic v5"
-            echo "  5. AnyTLS          6. Socks5           7. Shadowsocks-2022"
+            echo "  5. AnyTLS(Reality) 6. Socks5(明文慎用) 7. Shadowsocks-2022"
             reading "请输入协议编号: " add_inputs
             [ -z "$add_inputs" ] && return
             local need_argo_sync=0
@@ -2691,13 +3027,15 @@ change_config() {
     skyblue "------------"
     green "2. 修改全局 UUID / 密码"
     skyblue "------------"
-    green "3. 修改 Reality 伪装域名 (SNI)"
+    green "3. 修改 Reality 伪装域名 (SNI，同步作用于 VLESS / AnyTLS)"
     skyblue "------------"
     green "4. 添加 hysteria2 端口跳跃"
     skyblue "------------"
     green "5. 删除 hysteria2 端口跳跃"
     skyblue "------------"
     green "6. 修改 vmess-argo 优选域名/IP"
+    skyblue "------------"
+    green "7. 升级 / 切换 AnyTLS 伪装模式 (Reality / 真实证书，消除自签告警)"
     skyblue "------------"
     purple "0. 返回主菜单"
     skyblue "------------"
@@ -2769,8 +3107,13 @@ change_config() {
             check_nodes
             ;;
         3)
-            if ! proto_exists "vless-reality"; then
-                red "\nvless-reality 未启用！\n"; return
+            local has_any_reality=0
+            proto_exists "vless-reality" && has_any_reality=1
+            if proto_exists "anytls" && [ "$(jq -r '.inbounds[] | select(.tag == "anytls") | .tls.reality.enabled // false' "$inbounds_file" 2>/dev/null)" == "true" ]; then
+                has_any_reality=1
+            fi
+            if [ "$has_any_reality" -eq 0 ]; then
+                red "\n当前未启用 VLESS-Reality 或 AnyTLS-Reality！\n"; return
             fi
             green "\n1. www.joom.com  2. www.stengg.com  3. www.wedgehr.com  4. www.cerebrium.ai  5. www.nazhumi.com"
             reading "请输入新的伪装域名或序号 (回车默认1): " new_sni
@@ -2783,8 +3126,8 @@ change_config() {
             esac
             save_meta "REALITY_SNI" "$new_sni"
             jq --arg sni "$new_sni" \
-               '(.inbounds[] | select(.tag == "vless-reality") | .tls.server_name) = $sni |
-                (.inbounds[] | select(.tag == "vless-reality") | .tls.reality.handshake.server) = $sni' \
+               '(.inbounds[] | select(.tls.reality?.enabled == true) | .tls.server_name) = $sni |
+                (.inbounds[] | select(.tls.reality?.enabled == true) | .tls.reality.handshake.server) = $sni' \
                "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
             restart_singbox
             rebuild_urls
@@ -2846,7 +3189,8 @@ change_config() {
             rebuild_urls
             check_nodes
             ;;
-        0) need_pause=false; return ;;
+        7)  upgrade_anytls_tls ;;
+        0)  need_pause=false; return ;;
     esac
 }
 
@@ -3031,7 +3375,7 @@ menu() {
     green "3. 查看节点 Base64 编码"
     green "4. 协议节点管理 (添加 / 恢复 / 删除指定协议)"
     green "5. 重新设置入站 IP 与监听模式 (IPv4 / IPv6 / 双栈 / 自定义IP)"
-    green "6. 修改节点配置 (改端口 / UUID / Reality域名 / HY2跳跃)"
+    green "6. 修改节点配置 (端口 / UUID / Reality域名 / HY2跳跃 / AnyTLS伪装)"
     echo "=========================================================="
     green "7. sing-box 服务管理"
     green "8. Argo 隧道管理"
@@ -3039,13 +3383,15 @@ menu() {
     green "10. BBR 加速管理 (开启 / 关闭 BBR 加速通道)"
     green "11. 断联自动重启守护管理 (秒级自启 + 64M防OOM优化)"
     green "12. DNS 加密管理 (开启 DoH 防劫持 / 恢复系统默认 DNS)"
-    green "13. 节点连通性自检与服务器测速 (单线程防爆内存)"
+    green "13. 节点连通性自检与服务器测速 (含合规扫描 + 单线程测速)"
     echo "=========================================================="
     red   "0. 退出脚本"
     echo "=========================================================="
 }
 
 trap 'red "\n已退出脚本"; exit 0' INT
+
+init_pid_baselines
 
 case "$1" in
     -c | --check)
@@ -3103,7 +3449,7 @@ case "$1" in
         green "快捷键用法: sb [参数]"
         green "  sb                   打开交互式管理菜单"
         green "  sb -c                直接输出节点 Base64 编码 (自动同步最新Argo域名)"
-        green "  sb -t                执行节点运行与连通性自检"
+        green "  sb -t                执行节点运行、连通性与抗探测合规自检"
         green "  sb -s                执行服务器单线程轻量测速"
         green "  sb --apply-guard     无损启用断联自动重启守护与 64M 防崩溃优化"
         green "  sb -w                执行一次进程存活看门狗巡检"
