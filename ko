@@ -986,6 +986,14 @@ test_nodes_health() {
         echo -e " 4. Google 204 出口    : ${red}异常 (HTTP ${g_code:-超时})${re}"
     fi
 
+    local doh_enabled=0 doh_srv=""
+    if [ -f "${conf_dir}/dns.json" ] && command_exists jq; then
+        if [ "$(jq -r '.dns.servers[0].type // "local"' "${conf_dir}/dns.json" 2>/dev/null)" == "https" ]; then
+            doh_enabled=1
+            doh_srv=$(jq -r '.dns.servers[0].server // empty' "${conf_dir}/dns.json" 2>/dev/null)
+        fi
+    fi
+
     local cf_code
     cf_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
     if [ "$cf_code" == "200" ]; then
@@ -994,7 +1002,11 @@ test_nodes_health() {
         local cf_doh_code
         cf_doh_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 --resolve "dns.google:443:8.8.8.8" --doh-url "https://dns.google/dns-query" "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
         if [ "$cf_doh_code" == "200" ]; then
-            echo -e " 5. Cloudflare 测速口  : ${yellow}系统DNS受限，但加密DoH畅通 (建议进菜单 12 开启DoH)${re}"
+            if [ "$doh_enabled" -eq 1 ]; then
+                echo -e " 5. Cloudflare 测速口  : ${green}节点已开启加密DoH (${doh_srv}) 绕过母机限制，测速畅通${re}"
+            else
+                echo -e " 5. Cloudflare 测速口  : ${yellow}系统DNS受限，但加密DoH畅通 (建议进菜单 12 开启DoH)${re}"
+            fi
         else
             echo -e " 5. Cloudflare 测速口  : ${yellow}暂不可达 (HTTP ${cf_code:-超时})${re}"
         fi
@@ -1025,18 +1037,18 @@ run_speedtest() {
         v4_ok=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 --resolve "dns.google:443:8.8.8.8" --doh-url "https://dns.google/dns-query" "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
         if [ "$v4_ok" == "200" ]; then
             doh_args=(--resolve "dns.google:443:8.8.8.8" --doh-url "https://dns.google/dns-query")
-            yellow "提示: 检测到系统 DNS 无法解析 Cloudflare，本次测速已自动借道 Google IPv4 DoH。"
+            yellow "提示: 宿主机系统 53 端口 DNS 受限，本次测速已自动借道 Google IPv4 DoH。"
         else
             v6_ok=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 --resolve "dns.google:443:2001:4860:4860::8888" --doh-url "https://dns.google/dns-query" "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
             if [ "$v6_ok" == "200" ]; then
                 doh_args=(--resolve "dns.google:443:2001:4860:4860::8888" --doh-url "https://dns.google/dns-query")
-                yellow "提示: 检测到系统 DNS 无法解析 Cloudflare，本次测速已自动借道 Google IPv6 DoH。"
+                yellow "提示: 宿主机系统 53 端口 DNS 受限，本次测速已自动借道 Google IPv6 DoH。"
             fi
         fi
     fi
 
-    # 1. Cloudflare 延迟与下载测速 (20MB，最多12秒)
-    local cf_rtt cf_dl_bps cf_ul_bps
+    # 1. Cloudflare 延迟与下载/上传测速 (20MB下行 / 5MB上行，最多12秒)
+    local cf_rtt cf_rtt_ms cf_dl_bps cf_ul_bps
     cf_rtt=$(curl -s -o /dev/null -w "%{time_starttransfer}" --max-time 5 "${doh_args[@]}" "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
     cf_rtt_ms=$(awk -v t="${cf_rtt:-0}" 'BEGIN {printf "%.0f", t * 1000}')
     if [ "${cf_rtt_ms:-0}" -gt 0 ]; then
@@ -1049,9 +1061,9 @@ run_speedtest() {
         echo -e " Cloudflare 测速通道   : ${yellow}连接超时，已跳过${re}"
     fi
 
-    # 2. CacheFly 备用节点下载测速 (10MB，最多10秒)
+    # 2. CacheFly 备用节点下载测速 (10MB，复用 DoH 兜底)
     local cache_dl_bps
-    cache_dl_bps=$(curl -s -o /dev/null -w "%{speed_download}" --max-time 10 "https://cachefly.cachefly.net/10mb.test" 2>/dev/null)
+    cache_dl_bps=$(curl -s -o /dev/null -w "%{speed_download}" --max-time 10 "${doh_args[@]}" "https://cachefly.cachefly.net/10mb.test" 2>/dev/null)
     if awk -v b="${cache_dl_bps:-0}" 'BEGIN {exit !(b + 0 > 1000)}'; then
         echo -e " CacheFly   单线程下行 : ${green}$(format_speed_str "${cache_dl_bps:-0}")${re}"
     else
@@ -1373,7 +1385,7 @@ clean_firewall_rules() {
 }
 
 # =========================
-# 端口输入与按传输层协议 (TCP/UDP) 冲突校验函数
+# 端口输入与按传输层协议 (TCP/UDP) 冲突校验函数 (优先 ss / netstat 兼容 Alpine)
 # =========================
 is_system_port_used() {
     local p="$1"
@@ -1384,6 +1396,8 @@ is_system_port_used() {
 
     if command_exists ss; then
         ss "$ss_flag" 2>/dev/null | awk '{print $5}' | grep -Eq "(:|\])${p}$" && return 0
+    elif command_exists netstat; then
+        netstat "$ss_flag" 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0
     elif command_exists lsof; then
         if [ "$trans" == "tcp" ] || [ "$trans" == "local" ]; then
             lsof -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 && return 0
@@ -1392,8 +1406,6 @@ is_system_port_used() {
         else
             lsof -i :"$p" >/dev/null 2>&1 && return 0
         fi
-    elif command_exists netstat; then
-        netstat "$ss_flag" 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0
     fi
     return 1
 }
@@ -1407,8 +1419,9 @@ is_port_owned_by_singbox() {
 
     if command_exists ss; then
         ss "$ss_flag" 2>/dev/null | grep -E "(:|\])${p}[[:space:]]" | grep -q "sing-box" && return 0
-    fi
-    if command_exists lsof; then
+    elif command_exists netstat; then
+        netstat "$ss_flag" 2>/dev/null | grep -E "(:|\])${p}[[:space:]]" | grep -q "sing-box" && return 0
+    elif command_exists lsof; then
         lsof -i :"$p" 2>/dev/null | grep -q "sing-box" && return 0
     fi
     return 1
