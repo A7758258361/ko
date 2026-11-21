@@ -1037,17 +1037,16 @@ run_speedtest() {
         v4_ok=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 --resolve "dns.google:443:8.8.8.8" --doh-url "https://dns.google/dns-query" "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
         if [ "$v4_ok" == "200" ]; then
             doh_args=(--resolve "dns.google:443:8.8.8.8" --doh-url "https://dns.google/dns-query")
-            yellow "提示: 宿主机系统 53 端口 DNS 受限，本次测速已自动借道 Google IPv4 DoH。"
+            yellow "提示: 检测到系统 DNS 无法解析 Cloudflare，本次测速已自动借道 Google IPv4 DoH。"
         else
             v6_ok=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 --resolve "dns.google:443:2001:4860:4860::8888" --doh-url "https://dns.google/dns-query" "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
             if [ "$v6_ok" == "200" ]; then
                 doh_args=(--resolve "dns.google:443:2001:4860:4860::8888" --doh-url "https://dns.google/dns-query")
-                yellow "提示: 宿主机系统 53 端口 DNS 受限，本次测速已自动借道 Google IPv6 DoH。"
+                yellow "提示: 检测到系统 DNS 无法解析 Cloudflare，本次测速已自动借道 Google IPv6 DoH。"
             fi
         fi
     fi
 
-    # 1. Cloudflare 延迟与下载/上传测速 (20MB下行 / 5MB上行，最多12秒)
     local cf_rtt cf_rtt_ms cf_dl_bps cf_ul_bps
     cf_rtt=$(curl -s -o /dev/null -w "%{time_starttransfer}" --max-time 5 "${doh_args[@]}" "https://speed.cloudflare.com/__down?bytes=1000" 2>/dev/null)
     cf_rtt_ms=$(awk -v t="${cf_rtt:-0}" 'BEGIN {printf "%.0f", t * 1000}')
@@ -1061,9 +1060,8 @@ run_speedtest() {
         echo -e " Cloudflare 测速通道   : ${yellow}连接超时，已跳过${re}"
     fi
 
-    # 2. CacheFly 备用节点下载测速 (10MB，复用 DoH 兜底)
     local cache_dl_bps
-    cache_dl_bps=$(curl -s -o /dev/null -w "%{speed_download}" --max-time 10 "${doh_args[@]}" "https://cachefly.cachefly.net/10mb.test" 2>/dev/null)
+    cache_dl_bps=$(curl -s -o /dev/null -w "%{speed_download}" --max-time 10 "https://cachefly.cachefly.net/10mb.test" 2>/dev/null)
     if awk -v b="${cache_dl_bps:-0}" 'BEGIN {exit !(b + 0 > 1000)}'; then
         echo -e " CacheFly   单线程下行 : ${green}$(format_speed_str "${cache_dl_bps:-0}")${re}"
     else
@@ -1153,19 +1151,74 @@ detect_ipv6() {
     fi
 }
 
+format_region_label() {
+    local raw_code="$1"
+    local upper_code
+    upper_code=$(printf '%s' "$raw_code" | tr '[:lower:]' '[:upper:]')
+    case "$upper_code" in
+        HK|HKG)       echo "香港🇭🇰" ;;
+        TW|TWN)       echo "台湾🇹🇼" ;;
+        MO|MAC)       echo "澳门🇲🇴" ;;
+        JP|JPN)       echo "日本🇯🇵" ;;
+        SG|SGP)       echo "新加坡🇸🇬" ;;
+        KR|KOR)       echo "韩国🇰🇷" ;;
+        US|USA)       echo "美国🇺🇸" ;;
+        GB|UK|GBR)    echo "英国🇬🇧" ;;
+        DE|DEU)       echo "德国🇩🇪" ;;
+        FR|FRA)       echo "法国🇫🇷" ;;
+        CA|CAN)       echo "加拿大🇨🇦" ;;
+        AU|AUS)       echo "澳大利亚🇦🇺" ;;
+        NL|NLD)       echo "荷兰🇳🇱" ;;
+        RU|RUS)       echo "俄罗斯🇷🇺" ;;
+        IN|IND)       echo "印度🇮🇳" ;;
+        TH|THA)       echo "泰国🇹🇭" ;;
+        VN|VNM)       echo "越南🇻🇳" ;;
+        MY|MYS)       echo "马来西亚🇲🇾" ;;
+        *)            echo "$raw_code" ;;
+    esac
+}
+
 get_isp_name() {
     load_meta
     if [ -n "$ISP_NAME" ]; then
-        echo "$ISP_NAME"
+        format_region_label "$ISP_NAME"
         return
     fi
-    local isp
-    isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
-        awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
-        sed 's/[^a-zA-Z0-9_-]/_/g')
-    [ -z "$isp" ] && isp=$(hostname 2>/dev/null | sed 's/[^a-zA-Z0-9_-]/_/g' || echo "Node")
-    save_meta "ISP_NAME" "$isp"
-    echo "$isp"
+    local cc
+    cc=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
+        awk -F\" '{for(x=1;x<=NF;x++){if($x=="country_code"){print $(x+2); exit}}}' | \
+        sed 's/[^a-zA-Z0-9_-]//g')
+    if [ -z "$cc" ]; then
+        cc=$(hostname 2>/dev/null | sed 's/[^a-zA-Z0-9_-]//g' || echo "Node")
+    fi
+    save_meta "ISP_NAME" "$cc"
+    format_region_label "$cc"
+}
+
+format_proto_short_name() {
+    case "$1" in
+        vless-reality)    echo "reality" ;;
+        hysteria2)        echo "hy2" ;;
+        anytls)           echo "any" ;;
+        tuic)             echo "tuic" ;;
+        shadowsocks-2022) echo "ss2022" ;;
+        socks5-in)        echo "socks5" ;;
+        vmess-ws)         echo "argo-vmess" ;;
+        *)                echo "$1" ;;
+    esac
+}
+
+build_node_remark() {
+    local region="$1"
+    local stack_tag="$2"
+    local proto_tag="$3"
+    local p_short
+    p_short=$(format_proto_short_name "$proto_tag")
+    if [ -n "$stack_tag" ]; then
+        printf '%s-%s-%s' "$region" "$stack_tag" "$p_short"
+    else
+        printf '%s-%s' "$region" "$p_short"
+    fi
 }
 
 configure_inbound_stack_and_ip() {
@@ -1385,19 +1438,24 @@ clean_firewall_rules() {
 }
 
 # =========================
-# 端口输入与按传输层协议 (TCP/UDP) 冲突校验函数 (优先 ss / netstat 兼容 Alpine)
+# 端口输入与按传输层协议 (TCP/UDP) 冲突校验函数 (修复列号并兼容 Alpine)
 # =========================
 is_system_port_used() {
     local p="$1"
     local trans="${2:-both}"
-    local ss_flag="-tuln"
-    [ "$trans" == "tcp" ] || [ "$trans" == "local" ] && ss_flag="-tln"
-    [ "$trans" == "udp" ] && ss_flag="-uln"
 
     if command_exists ss; then
-        ss "$ss_flag" 2>/dev/null | awk '{print $5}' | grep -Eq "(:|\])${p}$" && return 0
+        case "$trans" in
+            tcp|local) ss -tln 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0 ;;
+            udp)       ss -uln 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0 ;;
+            *)         ss -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "(:|\])${p}$" && return 0 ;;
+        esac
     elif command_exists netstat; then
-        netstat "$ss_flag" 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0
+        case "$trans" in
+            tcp|local) netstat -tl 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0 ;;
+            udp)       netstat -ul 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0 ;;
+            *)         netstat -tul 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0 ;;
+        esac
     elif command_exists lsof; then
         if [ "$trans" == "tcp" ] || [ "$trans" == "local" ]; then
             lsof -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 && return 0
@@ -1413,14 +1471,15 @@ is_system_port_used() {
 is_port_owned_by_singbox() {
     local p="$1"
     local trans="${2:-both}"
-    local ss_flag="-tulnp"
-    [ "$trans" == "tcp" ] || [ "$trans" == "local" ] && ss_flag="-tlnp"
-    [ "$trans" == "udp" ] && ss_flag="-ulnp"
 
     if command_exists ss; then
-        ss "$ss_flag" 2>/dev/null | grep -E "(:|\])${p}[[:space:]]" | grep -q "sing-box" && return 0
+        case "$trans" in
+            tcp|local) ss -tlnp 2>/dev/null | awk '{print $4, $6}' | grep -Eq "(:|\])${p}([[:space:]]|\$)" | grep -q "sing-box" && return 0 ;;
+            udp)       ss -ulnp 2>/dev/null | awk '{print $4, $6}' | grep -Eq "(:|\])${p}([[:space:]]|\$)" | grep -q "sing-box" && return 0 ;;
+            *)         ss -tulnp 2>/dev/null | awk '{print $5, $7}' | grep -Eq "(:|\])${p}([[:space:]]|\$)" | grep -q "sing-box" && return 0 ;;
+        esac
     elif command_exists netstat; then
-        netstat "$ss_flag" 2>/dev/null | grep -E "(:|\])${p}[[:space:]]" | grep -q "sing-box" && return 0
+        netstat -tulnp 2>/dev/null | grep -Eq "(:|\])${p}[[:space:]]" | grep -q "sing-box" && return 0
     elif command_exists lsof; then
         lsof -i :"$p" 2>/dev/null | grep -q "sing-box" && return 0
     fi
@@ -1920,56 +1979,60 @@ rebuild_urls() {
 
     sync_latest_argo_domain || true
     load_meta
-    local isp
-    isp=$(get_isp_name)
+    local region
+    region=$(get_isp_name)
     local cfip="${CFIP_SAVED:-${CFIP}}"
     local cfport="${CFPORT_SAVED:-${CFPORT}}"
 
     local addr_list=()
-    local suffix_list=()
+    local stack_list=()
     case "${STACK_MODE}" in
         v4)
             local v4="${NODE_IPV4:-$(detect_ipv4)}"
             addr_list=("${v4:-127.0.0.1}")
-            suffix_list=("")
+            stack_list=("V4")
             ;;
         v6)
             local v6="${NODE_IPV6:-$(detect_ipv6)}"
             v6=$(echo "$v6" | tr -d '[]')
             addr_list=("[${v6:-::1}]")
-            suffix_list=("")
+            stack_list=("V6")
             ;;
         dual)
             local v4="${NODE_IPV4:-$(detect_ipv4)}"
             local v6="${NODE_IPV6:-$(detect_ipv6)}"
             v6=$(echo "$v6" | tr -d '[]')
-            [ -n "$v4" ] && { addr_list+=("$v4"); suffix_list+=("-v4"); }
-            [ -n "$v6" ] && { addr_list+=("[${v6}]"); suffix_list+=("-v6"); }
+            [ -n "$v4" ] && { addr_list+=("$v4"); stack_list+=("V4"); }
+            [ -n "$v6" ] && { addr_list+=("[${v6}]"); stack_list+=("V6"); }
             if [ "${#addr_list[@]}" -eq 0 ]; then
-                addr_list=("127.0.0.1"); suffix_list=("")
+                addr_list=("127.0.0.1"); stack_list=("V4")
             fi
             ;;
         *)
             local cip="${CUSTOM_NODE_IP:-$(detect_ipv4)}"
+            local c_stack="V4"
+            [[ "$cip" == *"["*":"*"]" ]] && c_stack="V6"
             addr_list=("${cip:-127.0.0.1}")
-            suffix_list=("")
+            stack_list=("${c_stack}")
             ;;
     esac
 
+    local default_stack="${stack_list[0]:-V4}"
     > "$client_dir"
 
     if proto_exists "vless-reality"; then
-        local v_port v_uuid v_sni
+        local v_port v_uuid v_sni remark
         v_port=$(jq -r '.inbounds[] | select(.tag == "vless-reality") | .listen_port' "$inbounds_file")
         v_uuid=$(jq -r '.inbounds[] | select(.tag == "vless-reality") | .users[0].uuid' "$inbounds_file")
         v_sni=$(jq -r '.inbounds[] | select(.tag == "vless-reality") | .tls.server_name' "$inbounds_file")
         for idx in "${!addr_list[@]}"; do
-            echo "vless://${v_uuid}@${addr_list[$idx]}:${v_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${v_sni}&fp=firefox&pbk=${PUBLIC_KEY}&type=tcp&headerType=none#${isp}${suffix_list[$idx]}-vless-reality" >> "$client_dir"
+            remark=$(build_node_remark "$region" "${stack_list[$idx]}" "vless-reality")
+            echo "vless://${v_uuid}@${addr_list[$idx]}:${v_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${v_sni}&fp=firefox&pbk=${PUBLIC_KEY}&type=tcp&headerType=none#${remark}" >> "$client_dir"
         done
     fi
 
     if proto_exists "vmess-ws"; then
-        local m_uuid argodomain
+        local m_uuid argodomain remark
         m_uuid=$(jq -r '.inbounds[] | select(.tag == "vmess-ws") | .users[0].uuid' "$inbounds_file")
         argodomain="${ARGO_DOMAIN}"
         if [ -z "$ARGO_TOKEN" ] && [ -f "${work_dir}/argo.log" ]; then
@@ -1980,9 +2043,10 @@ rebuild_urls() {
         [ -z "$argodomain" ] && argodomain="argo-pending.trycloudflare.com"
         save_meta "ARGO_DOMAIN" "$argodomain"
 
+        remark=$(build_node_remark "$region" "$default_stack" "vmess-ws")
         local vmess_json
         vmess_json=$(jq -cn \
-            --arg ps "${isp}-argo-vmess-ws" \
+            --arg ps "$remark" \
             --arg add "$cfip" \
             --arg port "$cfport" \
             --arg id "$m_uuid" \
@@ -1992,55 +2056,60 @@ rebuild_urls() {
     fi
 
     if proto_exists "hysteria2"; then
-        local h_port h_pass mport_str=""
+        local h_port h_pass mport_str="" remark
         h_port=$(jq -r '.inbounds[] | select(.tag == "hysteria2") | .listen_port' "$inbounds_file")
         h_pass=$(jq -r '.inbounds[] | select(.tag == "hysteria2") | .users[0].password' "$inbounds_file")
         if [ -n "$HY2_MPORT_MIN" ] && [ -n "$HY2_MPORT_MAX" ]; then
             mport_str="&mport=${h_port},${HY2_MPORT_MIN}-${HY2_MPORT_MAX}"
         fi
         for idx in "${!addr_list[@]}"; do
-            echo "hysteria2://${h_pass}@${addr_list[$idx]}:${h_port}/?sni=www.bing.com&insecure=1&pinSHA256=${FINGERPRINT}&alpn=h3&obfs=none${mport_str}#${isp}${suffix_list[$idx]}-hysteria2" >> "$client_dir"
+            remark=$(build_node_remark "$region" "${stack_list[$idx]}" "hysteria2")
+            echo "hysteria2://${h_pass}@${addr_list[$idx]}:${h_port}/?sni=www.bing.com&insecure=1&pinSHA256=${FINGERPRINT}&alpn=h3&obfs=none${mport_str}#${remark}" >> "$client_dir"
         done
     fi
 
     if proto_exists "tuic"; then
-        local t_port t_uuid t_pass
+        local t_port t_uuid t_pass remark
         t_port=$(jq -r '.inbounds[] | select(.tag == "tuic") | .listen_port' "$inbounds_file")
         t_uuid=$(jq -r '.inbounds[] | select(.tag == "tuic") | .users[0].uuid' "$inbounds_file")
         t_pass=$(jq -r '.inbounds[] | select(.tag == "tuic") | .users[0].password' "$inbounds_file")
         for idx in "${!addr_list[@]}"; do
-            echo "tuic://${t_uuid}:${t_pass}@${addr_list[$idx]}:${t_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}${suffix_list[$idx]}-tuic5" >> "$client_dir"
+            remark=$(build_node_remark "$region" "${stack_list[$idx]}" "tuic")
+            echo "tuic://${t_uuid}:${t_pass}@${addr_list[$idx]}:${t_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${remark}" >> "$client_dir"
         done
     fi
 
     if proto_exists "anytls"; then
-        local a_port a_pass
+        local a_port a_pass remark
         a_port=$(jq -r '.inbounds[] | select(.tag == "anytls") | .listen_port' "$inbounds_file")
         a_pass=$(jq -r '.inbounds[] | select(.tag == "anytls") | .users[0].password' "$inbounds_file")
         for idx in "${!addr_list[@]}"; do
-            echo "anytls://${a_pass}@${addr_list[$idx]}:${a_port}?insecure=1&sni=bing.com#${isp}${suffix_list[$idx]}-anytls" >> "$client_dir"
+            remark=$(build_node_remark "$region" "${stack_list[$idx]}" "anytls")
+            echo "anytls://${a_pass}@${addr_list[$idx]}:${a_port}?insecure=1&sni=bing.com#${remark}" >> "$client_dir"
         done
     fi
 
     if proto_exists "socks5-in"; then
-        local s_port s_user s_pass s_auth
+        local s_port s_user s_pass s_auth remark
         s_port=$(jq -r '.inbounds[] | select(.tag == "socks5-in") | .listen_port' "$inbounds_file")
         s_user=$(jq -r '.inbounds[] | select(.tag == "socks5-in") | .users[0].username' "$inbounds_file")
         s_pass=$(jq -r '.inbounds[] | select(.tag == "socks5-in") | .users[0].password' "$inbounds_file")
         s_auth=$(printf '%s:%s' "$s_user" "$s_pass" | b64_encode)
         for idx in "${!addr_list[@]}"; do
-            echo "socks://${s_auth}@${addr_list[$idx]}:${s_port}#${isp}${suffix_list[$idx]}-socks5" >> "$client_dir"
+            remark=$(build_node_remark "$region" "${stack_list[$idx]}" "socks5-in")
+            echo "socks://${s_auth}@${addr_list[$idx]}:${s_port}#${remark}" >> "$client_dir"
         done
     fi
 
     if proto_exists "shadowsocks-2022"; then
-        local ss_port ss_method ss_key ss_auth
+        local ss_port ss_method ss_key ss_auth remark
         ss_port=$(jq -r '.inbounds[] | select(.tag == "shadowsocks-2022") | .listen_port' "$inbounds_file")
         ss_method=$(jq -r '.inbounds[] | select(.tag == "shadowsocks-2022") | .method' "$inbounds_file")
         ss_key=$(jq -r '.inbounds[] | select(.tag == "shadowsocks-2022") | .password' "$inbounds_file")
         ss_auth=$(printf '%s:%s' "$ss_method" "$ss_key" | b64_encode)
         for idx in "${!addr_list[@]}"; do
-            echo "ss://${ss_auth}@${addr_list[$idx]}:${ss_port}#${isp}${suffix_list[$idx]}-ss2022" >> "$client_dir"
+            remark=$(build_node_remark "$region" "${stack_list[$idx]}" "shadowsocks-2022")
+            echo "ss://${ss_auth}@${addr_list[$idx]}:${ss_port}#${remark}" >> "$client_dir"
         done
     fi
 
